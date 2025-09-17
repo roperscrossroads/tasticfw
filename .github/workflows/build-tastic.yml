@@ -10,10 +10,10 @@ on:
       boards:
         description: 'Boards to build (comma-separated)'
         required: false
-        default: 'tracker-t1000-e,seeed-xiao-nrf52840'
+        default: 'tracker-t1000-e,seeed_xiao_nrf52840_kit'
 
 env:
-  DEFAULT_BOARDS: 'tracker-t1000-e,seeed-xiao-nrf52840'
+  DEFAULT_BOARDS: 'tracker-t1000-e,seeed_xiao_nrf52840_kit'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [tracker-t1000-e, seeed-xiao-nrf52840]
+        board: [tracker-t1000-e, seeed_xiao_nrf52840_kit]
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
           fi
 
           # Copy .uf2 files for nRF52 seeed-xiao
-          if [[ "${{ matrix.board }}" == "seeed-xiao-nrf52840" ]]; then
+          if [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit" ]]; then
             cp .pio/build/${{ matrix.board }}/*.uf2 release/${{ matrix.board }}/ || true
             cp .pio/build/${{ matrix.board }}/*.hex release/${{ matrix.board }}/ || true
             cp .pio/build/${{ matrix.board }}/firmware.uf2 release/${{ matrix.board }}/ || true
@@ -127,7 +127,7 @@ jobs:
             Built from the `tastic` branch.
 
             ### Included Boards:
-            - Seeed XIAO nRF52840 (`seeed-xiao-nrf52840`)
+            - Seeed XIAO nRF52840 Kit (`seeed_xiao_nrf52840_kit`)
             - Seeed SenseCAP Card Tracker T1000-E (`tracker-t1000-e`)
 
             ### Installation:
@@ -151,7 +151,7 @@ jobs:
           done
 
           # Create index.json
-          echo '{"version":"${{ github.ref_name }}","boards":["tracker-t1000-e","seeed-xiao-nrf52840"]}' > index.json
+          echo '{"version":"${{ github.ref_name }}","boards":["tracker-t1000-e","seeed_xiao_nrf52840_kit"]}' > index.json
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
