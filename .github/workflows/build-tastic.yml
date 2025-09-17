@@ -144,15 +144,85 @@ jobs:
       - name: Extract firmware for GitHub Pages
         run: |
           mkdir -p gh-pages-content
-          cd gh-pages-content
+          version="${GITHUB_REF#refs/tags/}"
 
-          # Extract all firmware files
-          for zip in ../release-files/*.zip; do
-            unzip -o "$zip"
+          echo "Extracting firmware files for version: $version"
+
+          # Process each board's ZIP file
+          for zip in release-files/firmware-*.zip; do
+            if [ -f "$zip" ]; then
+              echo "Processing: $zip"
+
+              # Extract board name from filename: firmware-{board}-{version}.zip
+              board=$(basename "$zip" | sed "s/firmware-\(.*\)-${version}\.zip/\1/")
+              echo "Board: $board"
+
+              # Create temp directory for extraction
+              temp_dir="temp_${board}"
+              mkdir -p "$temp_dir"
+              unzip -q "$zip" -d "$temp_dir"
+
+              # Find the board directory inside the ZIP
+              board_dir=$(find "$temp_dir" -type d -name "*${board}*" -o -name "${board}" | head -1)
+              if [ -z "$board_dir" ]; then
+                # If no specific board directory, look for the first subdirectory
+                board_dir=$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
+              fi
+
+              echo "Board directory found: $board_dir"
+
+              if [ -n "$board_dir" ] && [ -d "$board_dir" ]; then
+                # Copy and rename files to expected format
+                for file in "$board_dir"/*; do
+                  if [ -f "$file" ]; then
+                    filename=$(basename "$file")
+                    case "$filename" in
+                      "firmware.bin")
+                        cp "$file" "gh-pages-content/firmware-${board}-${version}.bin"
+                        echo "✓ firmware-${board}-${version}.bin"
+                        ;;
+                      "firmware.factory.bin")
+                        cp "$file" "gh-pages-content/firmware-${board}-${version}.factory.bin"
+                        echo "✓ firmware-${board}-${version}.factory.bin"
+                        ;;
+                      "firmware.uf2")
+                        cp "$file" "gh-pages-content/firmware-${board}-${version}.uf2"
+                        echo "✓ firmware-${board}-${version}.uf2"
+                        ;;
+                      "littlefs.bin"|"spiffs.bin")
+                        cp "$file" "gh-pages-content/littlefs-${board}-${version}.bin"
+                        echo "✓ littlefs-${board}-${version}.bin"
+                        ;;
+                      "bootloader.bin")
+                        cp "$file" "gh-pages-content/bootloader-${board}-${version}.bin"
+                        echo "✓ bootloader-${board}-${version}.bin"
+                        ;;
+                      "partitions.bin")
+                        cp "$file" "gh-pages-content/partitions-${board}-${version}.bin"
+                        echo "✓ partitions-${board}-${version}.bin"
+                        ;;
+                      *)
+                        echo "? Unknown file: $filename"
+                        ;;
+                    esac
+                  fi
+                done
+              else
+                echo "❌ Could not find board directory in $zip"
+              fi
+
+              # Clean up temp directory
+              rm -rf "$temp_dir"
+            fi
           done
 
+          # List all files that will be deployed
+          echo "Files to be deployed:"
+          ls -la gh-pages-content/
+
           # Create index.json
-          echo '{"version":"${{ github.ref_name }}","boards":["tracker-t1000-e","seeed_xiao_nrf52840_kit","heltec-v3"]}' > index.json
+          cd gh-pages-content
+          echo '{"version":"'$version'","boards":["tracker-t1000-e","seeed_xiao_nrf52840_kit","heltec-v3"]}' > index.json
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
