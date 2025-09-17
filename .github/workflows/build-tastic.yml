@@ -1,0 +1,161 @@
+name: Build Tastic Firmware
+
+on:
+  push:
+    branches: [tastic]
+    tags:
+      - 'tastic-v*'
+  workflow_dispatch:
+    inputs:
+      boards:
+        description: 'Boards to build (comma-separated)'
+        required: false
+        default: 'tracker-t1000-e,seeed-xiao-nrf52840'
+
+env:
+  DEFAULT_BOARDS: 'tracker-t1000-e,seeed-xiao-nrf52840'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [tracker-t1000-e, seeed-xiao-nrf52840]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tastic
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ matrix.board }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: |
+          pip install --upgrade pip
+          pip install platformio
+          platformio pkg update -g
+
+      - name: Build firmware for ${{ matrix.board }}
+        run: |
+          echo "Building ${{ matrix.board }}"
+          platformio run -e ${{ matrix.board }}
+
+      - name: Package firmware
+        run: |
+          mkdir -p release/${{ matrix.board }}
+
+          # Copy all .bin files for ESP32 tracker
+          if [[ "${{ matrix.board }}" == "tracker-t1000-e" ]]; then
+            cp .pio/build/${{ matrix.board }}/*.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.factory.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/littlefs.bin release/${{ matrix.board }}/ || true
+          fi
+
+          # Copy .uf2 files for nRF52 seeed-xiao
+          if [[ "${{ matrix.board }}" == "seeed-xiao-nrf52840" ]]; then
+            cp .pio/build/${{ matrix.board }}/*.uf2 release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/*.hex release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.uf2 release/${{ matrix.board }}/ || true
+          fi
+
+          # Create a zip for this board
+          cd release
+          zip -r firmware-${{ matrix.board }}-${GITHUB_SHA::7}.zip ${{ matrix.board }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: firmware-${{ matrix.board }}
+          path: release/*.zip
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/tastic-v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: firmware-artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          version="${GITHUB_REF#refs/tags/}"
+
+          # Collect all firmware zips
+          for dir in firmware-artifacts/firmware-*; do
+            if [ -d "$dir" ]; then
+              board=$(basename "$dir" | sed 's/firmware-//')
+              cp "$dir"/*.zip "release-files/firmware-${board}-${version}.zip"
+            fi
+          done
+
+          # Create combined zip
+          cd release-files
+          mkdir -p all-firmware
+          for zip in *.zip; do
+            unzip -o "$zip" -d all-firmware/
+          done
+          zip -r "tastic-firmware-${version}-all.zip" all-firmware/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Tastic Firmware ${{ github.ref_name }}
+          body: |
+            ## Tastic Mesh Firmware Release
+
+            Built from the `tastic` branch.
+
+            ### Included Boards:
+            - Seeed XIAO nRF52840 (`seeed-xiao-nrf52840`)
+            - Seeed SenseCAP Card Tracker T1000-E (`tracker-t1000-e`)
+
+            ### Installation:
+            Flash using the Tastic Web Flasher or manually with the appropriate tool for your device.
+
+            Commit: ${{ github.sha }}
+          files: release-files/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract firmware for GitHub Pages
+        run: |
+          mkdir -p gh-pages-content
+          cd gh-pages-content
+
+          # Extract all firmware files
+          for zip in ../release-files/*.zip; do
+            unzip -o "$zip"
+          done
+
+          # Create index.json
+          echo '{"version":"${{ github.ref_name }}","boards":["tracker-t1000-e","seeed-xiao-nrf52840"]}' > index.json
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages-content
+          destination_dir: firmware/${{ github.ref_name }}
