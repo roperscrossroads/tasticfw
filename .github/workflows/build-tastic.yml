@@ -57,16 +57,8 @@ jobs:
         run: |
           mkdir -p release/${{ matrix.board }}
 
-          # Copy all .bin files for ESP32 tracker
-          if [[ "${{ matrix.board }}" == "tracker-t1000-e" ]]; then
-            cp .pio/build/${{ matrix.board }}/*.bin release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/firmware.factory.bin release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/firmware.bin release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/littlefs.bin release/${{ matrix.board }}/ || true
-          fi
-
-          # Copy .uf2 files for nRF52 seeed-xiao
-          if [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit" ]]; then
+          # Copy .uf2/.hex files for nRF52 boards (both tracker and xiao)
+          if [[ "${{ matrix.board }}" == "tracker-t1000-e" ]] || [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit" ]]; then
             cp .pio/build/${{ matrix.board }}/*.uf2 release/${{ matrix.board }}/ || true
             cp .pio/build/${{ matrix.board }}/*.hex release/${{ matrix.board }}/ || true
             cp .pio/build/${{ matrix.board }}/firmware.uf2 release/${{ matrix.board }}/ || true
