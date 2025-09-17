@@ -235,19 +235,9 @@ jobs:
           echo "========================================="
           ls -la gh-pages-content/
 
-          # Create index.json with better formatting
+          # Create index.json
           cd gh-pages-content
-          cat > index.json << EOF
-{
-  "version": "$version",
-  "boards": [
-    "tracker-t1000-e",
-    "seeed_xiao_nrf52840_kit",
-    "heltec-v3"
-  ],
-  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-}
-EOF
+          echo "{\"version\":\"$version\",\"boards\":[\"tracker-t1000-e\",\"seeed_xiao_nrf52840_kit\",\"heltec-v3\"],\"timestamp\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > index.json
           echo ""
           echo "Created index.json"
 
