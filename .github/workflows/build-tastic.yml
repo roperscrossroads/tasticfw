@@ -10,10 +10,10 @@ on:
       boards:
         description: 'Boards to build (comma-separated)'
         required: false
-        default: 'tracker-t1000-e,seeed_xiao_nrf52840_kit'
+        default: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3'
 
 env:
-  DEFAULT_BOARDS: 'tracker-t1000-e,seeed_xiao_nrf52840_kit'
+  DEFAULT_BOARDS: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3'
 
 jobs:
   build:
@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [tracker-t1000-e, seeed_xiao_nrf52840_kit]
+        board: [tracker-t1000-e, seeed_xiao_nrf52840_kit, heltec-v3]
 
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +57,15 @@ jobs:
         run: |
           mkdir -p release/${{ matrix.board }}
 
-          # Copy .uf2/.hex files for nRF52 boards (both tracker and xiao)
+          # Copy .bin files for ESP32 boards (heltec-v3)
+          if [[ "${{ matrix.board }}" == "heltec-v3" ]]; then
+            cp .pio/build/${{ matrix.board }}/*.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.factory.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/littlefs.bin release/${{ matrix.board }}/ || true
+          fi
+
+          # Copy .uf2/.hex files for nRF52 boards (tracker and xiao)
           if [[ "${{ matrix.board }}" == "tracker-t1000-e" ]] || [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit" ]]; then
             cp .pio/build/${{ matrix.board }}/*.uf2 release/${{ matrix.board }}/ || true
             cp .pio/build/${{ matrix.board }}/*.hex release/${{ matrix.board }}/ || true
@@ -119,8 +127,9 @@ jobs:
             Built from the `tastic` branch.
 
             ### Included Boards:
-            - Seeed XIAO nRF52840 Kit (`seeed_xiao_nrf52840_kit`)
-            - Seeed SenseCAP Card Tracker T1000-E (`tracker-t1000-e`)
+            - Seeed XIAO nRF52840 Kit (`seeed_xiao_nrf52840_kit`) - nRF52840
+            - Seeed SenseCAP Card Tracker T1000-E (`tracker-t1000-e`) - nRF52840
+            - Heltec WiFi LoRa 32 V3 (`heltec-v3`) - ESP32-S3
 
             ### Installation:
             Flash using the Tastic Web Flasher or manually with the appropriate tool for your device.
@@ -143,7 +152,7 @@ jobs:
           done
 
           # Create index.json
-          echo '{"version":"${{ github.ref_name }}","boards":["tracker-t1000-e","seeed_xiao_nrf52840_kit"]}' > index.json
+          echo '{"version":"${{ github.ref_name }}","boards":["tracker-t1000-e","seeed_xiao_nrf52840_kit","heltec-v3"]}' > index.json
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
