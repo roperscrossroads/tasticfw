@@ -1,0 +1,250 @@
+name: Build Tastic Firmware
+
+on:
+  push:
+    branches: [tastic]
+    tags:
+      - 'tastic-v*'
+  workflow_dispatch:
+    inputs:
+      boards:
+        description: 'Boards to build (comma-separated)'
+        required: false
+        default: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3,rak4631'
+
+env:
+  DEFAULT_BOARDS: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3,rak4631'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [tracker-t1000-e, seeed_xiao_nrf52840_kit, heltec-v3, rak4631]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tastic
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ matrix.board }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: |
+          pip install --upgrade pip
+          pip install platformio
+          platformio pkg update -g
+
+      - name: Build firmware for ${{ matrix.board }}
+        run: |
+          echo "Building ${{ matrix.board }}"
+          platformio run -e ${{ matrix.board }}
+
+      - name: Package firmware
+        run: |
+          mkdir -p release/${{ matrix.board }}
+
+          # Copy .bin files for ESP32 boards (heltec-v3)
+          if [[ "${{ matrix.board }}" == "heltec-v3" ]]; then
+            cp .pio/build/${{ matrix.board }}/*.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.factory.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.bin release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/littlefs.bin release/${{ matrix.board }}/ || true
+          fi
+
+          # Copy .uf2/.hex files for nRF52 boards (tracker, xiao, and rak4631)
+          if [[ "${{ matrix.board }}" == "tracker-t1000-e" ]] || [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit" ]] || [[ "${{ matrix.board }}" == "rak4631" ]]; then
+            cp .pio/build/${{ matrix.board }}/*.uf2 release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/*.hex release/${{ matrix.board }}/ || true
+            cp .pio/build/${{ matrix.board }}/firmware.uf2 release/${{ matrix.board }}/ || true
+          fi
+
+          # Create a zip for this board
+          cd release
+          zip -r firmware-${{ matrix.board }}-${GITHUB_SHA::7}.zip ${{ matrix.board }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.board }}
+          path: release/*.zip
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/tastic-v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: firmware-artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          version="${GITHUB_REF#refs/tags/}"
+
+          # Collect all firmware zips
+          for dir in firmware-artifacts/firmware-*; do
+            if [ -d "$dir" ]; then
+              board=$(basename "$dir" | sed 's/firmware-//')
+              cp "$dir"/*.zip "release-files/firmware-${board}-${version}.zip"
+            fi
+          done
+
+          # Create combined zip
+          cd release-files
+          mkdir -p all-firmware
+          for zip in *.zip; do
+            unzip -o "$zip" -d all-firmware/
+          done
+          zip -r "tastic-firmware-${version}-all.zip" all-firmware/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Tastic Firmware ${{ github.ref_name }}
+          body: |
+            ## Tastic Mesh Firmware Release
+
+            Built from the `tastic` branch.
+
+            ### Included Boards:
+            - RAK4631 WisBlock Core (`rak4631`) - nRF52840
+            - Seeed XIAO nRF52840 Kit (`seeed_xiao_nrf52840_kit`) - nRF52840
+            - Seeed SenseCAP Card Tracker T1000-E (`tracker-t1000-e`) - nRF52840
+            - Heltec WiFi LoRa 32 V3 (`heltec-v3`) - ESP32-S3
+
+            ### Installation:
+            Flash using the Tastic Web Flasher or manually with the appropriate tool for your device.
+
+            Commit: ${{ github.sha }}
+          files: release-files/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract firmware for GitHub Pages
+        run: |
+          mkdir -p gh-pages-content
+          version="${GITHUB_REF#refs/tags/}"
+
+          echo "========================================="
+          echo "Extracting firmware files for version: $version"
+          echo "========================================="
+
+          # Process each board's ZIP file
+          for zip in release-files/firmware-*.zip; do
+            if [ -f "$zip" ]; then
+              echo ""
+              echo "Processing ZIP: $zip"
+              echo "-----------------------------------------"
+
+              # Extract board name from filename: firmware-{board}-{version}.zip
+              board=$(basename "$zip" | sed "s/firmware-\(.*\)-${version}\.zip/\1/")
+              echo "Extracted board name: $board"
+
+              # Create temp directory for extraction
+              temp_dir="temp_${board}"
+              mkdir -p "$temp_dir"
+
+              # Extract and show contents
+              echo "Extracting ZIP to $temp_dir..."
+              unzip -q "$zip" -d "$temp_dir"
+
+              echo "ZIP contents:"
+              find "$temp_dir" -type f -name "*.bin" -o -name "*.uf2" -o -name "*.hex" | head -20
+
+              # The ZIP contains a board directory, so let's find all firmware files
+              echo ""
+              echo "Looking for firmware files..."
+
+              # Find all relevant files and copy them with proper names
+              find "$temp_dir" -type f \( -name "*.bin" -o -name "*.uf2" -o -name "*.hex" \) | while read -r file; do
+                filename=$(basename "$file")
+                echo "Found: $filename at $file"
+
+                case "$filename" in
+                  firmware.bin)
+                    dest="gh-pages-content/firmware-${board}-${version}.bin"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: firmware-${board}-${version}.bin"
+                    ;;
+                  firmware.factory.bin)
+                    dest="gh-pages-content/firmware-${board}-${version}.factory.bin"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: firmware-${board}-${version}.factory.bin"
+                    ;;
+                  firmware.uf2)
+                    dest="gh-pages-content/firmware-${board}-${version}.uf2"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: firmware-${board}-${version}.uf2"
+                    ;;
+                  firmware.hex)
+                    dest="gh-pages-content/firmware-${board}-${version}.hex"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: firmware-${board}-${version}.hex"
+                    ;;
+                  littlefs.bin|spiffs*.bin)
+                    dest="gh-pages-content/littlefs-${board}-${version}.bin"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: littlefs-${board}-${version}.bin"
+                    ;;
+                  bootloader.bin|bootloader-*.bin)
+                    dest="gh-pages-content/bootloader-${board}-${version}.bin"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: bootloader-${board}-${version}.bin"
+                    ;;
+                  partitions.bin|partitions-*.bin)
+                    dest="gh-pages-content/partitions-${board}-${version}.bin"
+                    cp "$file" "$dest"
+                    echo "  → Copied to: partitions-${board}-${version}.bin"
+                    ;;
+                  *.bin|*.uf2|*.hex)
+                    echo "  ⚠ Unhandled file: $filename"
+                    ;;
+                esac
+              done
+
+              # Clean up temp directory
+              rm -rf "$temp_dir"
+              echo "Cleaned up $temp_dir"
+            fi
+          done
+
+          echo ""
+          echo "========================================="
+          echo "Files to be deployed to GitHub Pages:"
+          echo "========================================="
+          ls -la gh-pages-content/
+
+          # Create index.json
+          cd gh-pages-content
+          echo "{\"version\":\"$version\",\"boards\":[\"tracker-t1000-e\",\"seeed_xiao_nrf52840_kit\",\"heltec-v3\",\"rak4631\"],\"timestamp\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > index.json
+          echo ""
+          echo "Created index.json"
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages-content
+          destination_dir: firmware/${{ github.ref_name }}
