@@ -21,7 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [tracker-t1000-e, seeed_xiao_nrf52840_kit, heltec-v3, rak4631, seeed-xiao-s3, heltec-mesh-node-t114, t-echo, tracker-t1000-e_csra, seeed_xiao_nrf52840_kit_csra, heltec-v3_csra, rak4631_csra, seeed-xiao-s3_csra, heltec-mesh-node-t114_csra, t-echo_csra]
+        platform:
+          - name: nrf52
+            boards: "tracker-t1000-e,seeed_xiao_nrf52840_kit,rak4631,heltec-mesh-node-t114,t-echo,tracker-t1000-e_csra,seeed_xiao_nrf52840_kit_csra,rak4631_csra,heltec-mesh-node-t114_csra,t-echo_csra"
+          - name: esp32
+            boards: "heltec-v3,seeed-xiao-s3,heltec-v3_csra,seeed-xiao-s3_csra"
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +44,7 @@ jobs:
           path: |
             ~/.platformio
             ~/.cache/pip
-          key: ${{ runner.os }}-pio-${{ matrix.board }}-${{ hashFiles('platformio.ini') }}
+          key: ${{ runner.os }}-pio-${{ matrix.platform.name }}-${{ hashFiles('platformio.ini') }}
 
       - name: Install PlatformIO
         run: |
@@ -48,38 +52,49 @@ jobs:
           pip install platformio
           platformio pkg update -g
 
-      - name: Build firmware for ${{ matrix.board }}
+      - name: Build firmware for ${{ matrix.platform.name }} platform
         run: |
-          echo "Building ${{ matrix.board }}"
-          platformio run -e ${{ matrix.board }}
+          echo "Building ${{ matrix.platform.name }} boards: ${{ matrix.platform.boards }}"
+          IFS=',' read -ra BOARDS <<< "${{ matrix.platform.boards }}"
+          for board in "${BOARDS[@]}"; do
+            echo "Building $board"
+            platformio run -e "$board"
+          done
 
       - name: Package firmware
         run: |
-          mkdir -p release/${{ matrix.board }}
+          mkdir -p release
+          
+          IFS=',' read -ra BOARDS <<< "${{ matrix.platform.boards }}"
+          for board in "${BOARDS[@]}"; do
+            echo "Packaging $board"
+            mkdir -p release/$board
+            
+            # Copy .bin files for ESP32 boards
+            if [[ "${{ matrix.platform.name }}" == "esp32" ]]; then
+              cp .pio/build/$board/*.bin release/$board/ || true
+              cp .pio/build/$board/firmware.factory.bin release/$board/ || true
+              cp .pio/build/$board/firmware.bin release/$board/ || true
+              cp .pio/build/$board/littlefs.bin release/$board/ || true
+            fi
 
-          # Copy .bin files for ESP32 boards (heltec-v3, seeed-xiao-s3)
-          if [[ "${{ matrix.board }}" == "heltec-v3" ]] || [[ "${{ matrix.board }}" == "heltec-v3_csra" ]] || [[ "${{ matrix.board }}" == "seeed-xiao-s3" ]] || [[ "${{ matrix.board }}" == "seeed-xiao-s3_csra" ]]; then
-            cp .pio/build/${{ matrix.board }}/*.bin release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/firmware.factory.bin release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/firmware.bin release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/littlefs.bin release/${{ matrix.board }}/ || true
-          fi
+            # Copy .uf2/.hex files for nRF52 boards
+            if [[ "${{ matrix.platform.name }}" == "nrf52" ]]; then
+              cp .pio/build/$board/*.uf2 release/$board/ || true
+              cp .pio/build/$board/*.hex release/$board/ || true
+              cp .pio/build/$board/firmware.uf2 release/$board/ || true
+            fi
 
-          # Copy .uf2/.hex files for nRF52 boards (tracker, xiao, and rak4631)
-          if [[ "${{ matrix.board }}" == "tracker-t1000-e" ]] || [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit" ]] || [[ "${{ matrix.board }}" == "rak4631" ]] || [[ "${{ matrix.board }}" == "heltec-mesh-node-t114" ]] || [[ "${{ matrix.board }}" == "t-echo" ]] || [[ "${{ matrix.board }}" == "tracker-t1000-e_csra" ]] || [[ "${{ matrix.board }}" == "seeed_xiao_nrf52840_kit_csra" ]] || [[ "${{ matrix.board }}" == "rak4631_csra" ]] || [[ "${{ matrix.board }}" == "heltec-mesh-node-t114_csra" ]] || [[ "${{ matrix.board }}" == "t-echo_csra" ]]; then
-            cp .pio/build/${{ matrix.board }}/*.uf2 release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/*.hex release/${{ matrix.board }}/ || true
-            cp .pio/build/${{ matrix.board }}/firmware.uf2 release/${{ matrix.board }}/ || true
-          fi
-
-          # Create a zip for this board
-          cd release
-          zip -r firmware-${{ matrix.board }}-${GITHUB_SHA::7}.zip ${{ matrix.board }}
+            # Create individual zip for this board (same format as before)
+            cd release
+            zip -r firmware-$board-${GITHUB_SHA::7}.zip $board
+            cd ..
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.board }}
+          name: firmware-${{ matrix.platform.name }}-platform
           path: release/*.zip
           retention-days: 30
 
@@ -101,15 +116,26 @@ jobs:
           mkdir -p release-files
           version="${GITHUB_REF#refs/tags/}"
 
-          # Collect all firmware zips
-          for dir in firmware-artifacts/firmware-*; do
-            if [ -d "$dir" ]; then
-              board=$(basename "$dir" | sed 's/firmware-//')
-              cp "$dir"/*.zip "release-files/firmware-${board}-${version}.zip"
+          # Collect all firmware zips from platform artifacts
+          # This creates the same structure as before: individual board ZIP files
+          for platform_dir in firmware-artifacts/firmware-*-platform; do
+            if [ -d "$platform_dir" ]; then
+              echo "Processing platform directory: $platform_dir"
+              # Copy all ZIP files from this platform
+              for zip in "$platform_dir"/*.zip; do
+                if [ -f "$zip" ]; then
+                  board=$(basename "$zip" | sed "s/firmware-\(.*\)-${GITHUB_SHA::7}\.zip/\1/")
+                  echo "Found board: $board"
+                  cp "$zip" "release-files/firmware-${board}-${version}.zip"
+                fi
+              done
             fi
           done
 
-          # Create combined zip
+          echo "Final release files:"
+          ls -la release-files/
+
+          # Create combined zip (same as before)
           cd release-files
           mkdir -p all-firmware
           for zip in *.zip; do
