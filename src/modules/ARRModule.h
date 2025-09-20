@@ -2,6 +2,8 @@
 #include "SinglePortModule.h"
 #include "configuration.h"
 #include "mesh/generated/meshtastic/module_config.pb.h"
+#include <map>
+#include <vector>
 
 /**
  * ARR (like a pirate) - EXPERIMENTAL
