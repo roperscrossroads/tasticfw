@@ -48,25 +48,13 @@ int32_t ARRModule::runOnce()
 
     uint32_t now = millis();
     
-    // Check if we should send periodic status broadcast (every 5 minutes)
-    if (statusBroadcastEnabled && (now - lastPeriodicBroadcast >= PERIODIC_BROADCAST_INTERVAL)) {
-        broadcastComprehensiveStatus();
-        lastPeriodicBroadcast = now;
-    }
-    
     // Only do full evaluation every EVALUATION_INTERVAL
     if (now - lastEvaluation < EVALUATION_INTERVAL) {
-        return 30 * 1000; // Check again in 30 seconds for periodic broadcasts
+        return 30 * 1000; // Check again in 30 seconds
     }
     
     evaluationCount++;
     lastEvaluation = now;
-    
-    // Send startup message on first evaluation
-    if (evaluationCount == 1 && statusBroadcastEnabled) {
-        broadcastComprehensiveStatus(); // Send full status on startup
-        lastPeriodicBroadcast = now;
-    }
     
     // Always respect minimum role change interval
     if (shouldDelayRoleChange()) {
@@ -380,12 +368,6 @@ void ARRModule::broadcastRoleChange(bool wasMuted, bool nowMuted, const char* re
              reason);
     
     broadcastStatusMessage(message);
-    
-    // Also send comprehensive status after role change
-    if (millis() - lastPeriodicBroadcast > 60000) { // Don't spam if just sent
-        broadcastComprehensiveStatus();
-        lastPeriodicBroadcast = millis();
-    }
 }
 
 void ARRModule::broadcastComprehensiveStatus()
