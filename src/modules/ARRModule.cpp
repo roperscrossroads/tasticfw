@@ -1,6 +1,7 @@
 #include "ARRModule.h"
 #include "MeshService.h"
 #include "NodeDB.h" 
+#include "NodeStatus.h"
 #include "RTC.h"
 #include "main.h"
 #include "modules/NodeInfoModule.h"
@@ -8,6 +9,7 @@
 #include "mesh/Router.h"
 #include <cstring>
 #include <map>
+#include <algorithm> // For std::find if needed
 
 extern Router *router;
 
@@ -23,14 +25,26 @@ ARRModule::ARRModule()
         
         moduleEnabled = true;
         
-        // Hardcoded priority shortnames for testing
-        priorityShortnames.push_back("rxr1");
-        priorityShortnames.push_back("CSR1");
-        priorityShortnames.push_back("7e4c");
-        priorityShortnames.push_back("WOLF");
-        priorityShortnames.push_back("TCMQ");
-        priorityShortnames.push_back("CSR5");
-        priorityShortnames.push_back("CS11");
+        // Set up NodeStatus observer for immediate node updates
+        if (nodeStatus) {
+            nodeStatusObserver.observe(&nodeStatus->onNewStatus);
+            LOG_DEBUG("ARR: NodeStatus observer initialized");
+        } else {
+            LOG_WARN("ARR: nodeStatus not available during initialization");
+        }
+        
+        // TODO: Load priority shortnames from configuration instead of hardcoding
+        // For now, keep the test configuration but add validation
+        const char* defaultPriorityNodes[] = {
+            "rxr1", "CSR1", "7e4c", "WOLF", "TCMQ", "CSR5", "CS11"
+        };
+        
+        LOG_WARN("ARR: Using hardcoded priority nodes (should be configurable)");
+        for (size_t i = 0; i < sizeof(defaultPriorityNodes) / sizeof(defaultPriorityNodes[0]); i++) {
+            if (!addPriorityShortname(defaultPriorityNodes[i])) {
+                LOG_WARN("ARR: Failed to add priority node: %s", defaultPriorityNodes[i]);
+            }
+        }
         
         // Start with a short delay to let the mesh settle
         setIntervalFromNow(30 * 1000); // 30 seconds initial delay
@@ -43,21 +57,30 @@ ARRModule::ARRModule()
 int32_t ARRModule::runOnce()
 {
     if (!moduleEnabled) {
+        LOG_WARN("ARR: runOnce called on disabled module");
         return EVALUATION_INTERVAL; // Shouldn't happen, but safety check
     }
 
     uint32_t now = millis();
     
-    // Only do full evaluation every EVALUATION_INTERVAL
-    if (now - lastEvaluation < EVALUATION_INTERVAL) {
-        return 30 * 1000; // Check again in 30 seconds
+    // Check if we should do an evaluation due to node status updates
+    bool shouldEvaluate = pendingEvaluation || (now - lastEvaluation >= EVALUATION_INTERVAL);
+    
+    if (!shouldEvaluate) {
+        return FAST_CHECK_INTERVAL; // Check again sooner rather than using magic number
     }
     
     evaluationCount++;
     lastEvaluation = now;
+    bool wasTriggeredByUpdate = pendingEvaluation;
+    pendingEvaluation = false; // Clear the pending flag
+    
+    LOG_DEBUG("ARR: Starting evaluation #%d (triggered by: %s)", 
+             evaluationCount, wasTriggeredByUpdate ? "node update" : "timer");
     
     // Always respect minimum role change interval
     if (shouldDelayRoleChange()) {
+        LOG_DEBUG("ARR: Role change delayed due to cooldown");
         return getNextCheckInterval();
     }
 
@@ -96,20 +119,36 @@ int32_t ARRModule::runOnce()
 
 bool ARRModule::checkStrongSignalOverride()
 {
-    // Use validated time for priority override decisions to avoid false positives with bad clocks
-    uint32_t now = getValidTime(RTCQualityDevice);
-    if (now == 0) {
-        return false; // Can't make reliable time-based decisions without valid time
-    }
-    
     if (priorityShortnames.empty()) {
         return false; 
     }
+    
+    if (!nodeDB || !nodeDB->meshNodes) {
+        LOG_WARN("ARR: NodeDB not available");
+        return false;
+    }
+    
     bool hasStrongSignal = false;
+    RTCQuality timeQuality = getRTCQuality();
+    
+    // Log time quality for debugging
+    LOG_DEBUG("ARR: Evaluating with time quality: %s", RtcName(timeQuality));
+
+    // Handle the critical case where time functions might return 0
+    uint32_t currentTime = 0;
+    bool timeIsReliable = false;
+    
+    if (timeQuality >= RTCQualityFromNet) {
+        currentTime = getValidTime(RTCQualityFromNet);
+        timeIsReliable = (currentTime != 0);
+    } else {
+        // For poor time quality, we'll rely on activity-based evaluation
+        LOG_DEBUG("ARR: Time quality poor (%s), using activity-based evaluation", RtcName(timeQuality));
+    }
 
     for (int i = 0; i < nodeDB->numMeshNodes; i++) {
         auto node = nodeDB->getMeshNodeByIndex(i);
-        if (!node) continue;
+        if (!node || !node->has_user) continue;
 
         // Check if this is a priority node
         bool isPriorityNode = false;
@@ -124,24 +163,40 @@ bool ARRModule::checkStrongSignalOverride()
 
         // DIRECT LINKS ONLY: Skip MQTT and multi-hop messages
         if (node->via_mqtt) {
+            LOG_DEBUG("ARR: Skipping MQTT node %s", node->user.short_name);
             continue;
         }
         
         if (node->has_hops_away && node->hops_away > 0) {
+            LOG_DEBUG("ARR: Skipping multi-hop node %s (hops: %d)", node->user.short_name, node->hops_away);
             continue;
         }
 
-        // Check if node is recently heard and has strong signal
-        uint32_t timeSinceHeard = sinceLastSeen_fromTimestamp(node->last_heard);
-        if (timeSinceHeard > STRONG_SIGNAL_TIMEOUT_SEC) {
+        // Use improved node data reliability assessment
+        if (!isNodeDataReliable(node)) {
+            LOG_DEBUG("ARR: Node %s data not reliable (age: %ds, quality: %s)", 
+                     node->user.short_name, getNodeAge(node), RtcName(timeQuality));
             continue;
         }
 
-        // Check SNR threshold - now we can trust it since it's a direct link
+        // Check SNR threshold - now we can trust it since it's a direct link with reliable data
         if (node->snr >= STRONG_SIGNAL_OVERRIDE_SNR) {
             hasStrongSignal = true;
-            lastStrongSignalOverride = now;
+            
+            // Record when we detected strong signal, handling time=0 case
+            if (timeIsReliable && currentTime != 0) {
+                lastStrongSignalOverride = currentTime;
+            } else {
+                // Fallback to millis-based timestamp for consistency tracking
+                lastStrongSignalOverride = millis() / 1000; // Convert to seconds for consistency
+            }
+            
+            LOG_INFO("ARR: Strong signal detected from priority node %s (SNR: %.1fdB, time quality: %s)", 
+                    node->user.short_name, node->snr, RtcName(timeQuality));
             break; // One strong signal is enough
+        } else {
+            LOG_DEBUG("ARR: Priority node %s signal too weak (SNR: %.1fdB < %.1fdB)", 
+                     node->user.short_name, node->snr, STRONG_SIGNAL_OVERRIDE_SNR);
         }
     }
 
@@ -153,6 +208,12 @@ void ARRModule::refreshRouterCache()
 {
     cachedRouters.clear();
     totalRouterCount = 0;
+    
+    if (!nodeDB || !nodeDB->meshNodes) {
+        LOG_WARN("ARR: NodeDB not available for router cache refresh");
+        return;
+    }
+    
     uint32_t now = getTime(); // Use consistent time source with sinceLastSeen()
 
     for (int i = 0; i < nodeDB->numMeshNodes; i++) {
@@ -181,6 +242,7 @@ void ARRModule::refreshRouterCache()
     }
 
     lastNodeDBUpdate = nodeDB->meshNodes->size();
+    LOG_DEBUG("ARR: Router cache refreshed: %d routers found", totalRouterCount);
 }
 
 bool ARRModule::isValidRouter(const meshtastic_NodeInfoLite *node) const
@@ -194,8 +256,8 @@ bool ARRModule::isValidRouter(const meshtastic_NodeInfoLite *node) const
         return false;
     }
 
-    // Must be recently active (15 minutes)
-    if (sinceLastSeen_fromTimestamp(node->last_heard) > ROUTER_TIMEOUT_SEC) {
+    // Must be recently active (15 minutes) - use NodeDB's method
+    if (getNodeAge(node) > ROUTER_TIMEOUT_SEC) {
         return false;
     }
 
@@ -254,48 +316,207 @@ bool ARRModule::shouldDelayRoleChange() const
     return false; // Cooldown expired
 }
 
-uint32_t ARRModule::getNextCheckInterval()
+uint32_t ARRModule::getNextCheckInterval() const
 {
     // Use faster checks when network seems unstable
     return networkIsStable ? EVALUATION_INTERVAL : FAST_CHECK_INTERVAL;
 }
 
-uint32_t ARRModule::sinceLastSeen_fromTimestamp(uint32_t timestamp) const
+int ARRModule::onNodeStatusUpdate(const meshtastic::Status *newStatus)
 {
-    uint32_t now = getTime(); // Use same time source as NodeDB's sinceLastSeen()
+    if (!newStatus || !moduleEnabled) {
+        return 0; // Ignore invalid updates or when module disabled
+    }
     
-    int delta = (int)(now - timestamp);
-    if (delta < 0) // Handle clock drift - same as NodeDB implementation
-        delta = 0;
-        
-    return delta;
+    // React immediately to node database changes
+    lastNodeUpdate = millis();
+    pendingEvaluation = true;
+    
+    LOG_DEBUG("ARR: NodeStatus update received, scheduling evaluation");
+    
+    // Trigger evaluation sooner than the normal interval
+    setIntervalFromNow(5 * 1000); // 5 seconds delay to allow multiple rapid updates to settle
+    
+    return 0;
 }
 
-void ARRModule::addPriorityShortname(const String& shortname)
+uint32_t ARRModule::getNodeAge(const meshtastic_NodeInfoLite *node) const
 {
-    // Check if already exists
+    if (!node) {
+        return UINT32_MAX; // Invalid node is considered infinitely old
+    }
+    
+    // Use NodeDB's built-in method which handles time quality and clock drift properly
+    // Note: sinceLastSeen() uses getTime() internally, which may return 0-based time
+    // when no valid time source is available, but it still provides relative aging
+    uint32_t age = sinceLastSeen(node);
+    
+    // Handle the case where getTime() returns a very small value due to time not being set
+    // In this case, sinceLastSeen might return a very large value, so we need to be careful
+    RTCQuality timeQuality = getRTCQuality();
+    if (timeQuality == RTCQualityNone && age > (365 * 24 * 60 * 60)) {
+        // If time quality is none and age seems impossibly large (> 1 year),
+        // the time system probably isn't working correctly
+        LOG_DEBUG("ARR: Time quality none and age > 1 year (%d), using fallback evaluation", age);
+        return UINT32_MAX; // Force fallback to non-time-based evaluation
+    }
+    
+    return age;
+}
+
+bool ARRModule::evaluateNodeActivityWithoutTime(const meshtastic_NodeInfoLite *node) const
+{
+    if (!node) {
+        return false;
+    }
+    
+    // When time is unreliable, use alternative indicators of node activity:
+    
+    // 1. Signal strength - good SNR suggests recent communication
+    if (node->snr < -15.0f) {
+        LOG_DEBUG("ARR: Node %s poor signal (%0.1fdB) in no-time mode", node->user.short_name, node->snr);
+        return false;
+    }
+    
+    // 2. Hop count - prefer direct connections
+    if (node->has_hops_away && node->hops_away > 1) {
+        LOG_DEBUG("ARR: Node %s too many hops (%d) in no-time mode", node->user.short_name, node->hops_away);
+        return false;
+    }
+    
+    // 3. MQTT nodes are less reliable for direct communication assessment
+    if (node->via_mqtt) {
+        LOG_DEBUG("ARR: Node %s via MQTT in no-time mode", node->user.short_name);
+        return false;
+    }
+    
+    // 4. Check if the node has reasonable data (not ancient build epoch indicators)
+    if (node->last_heard != 0 && node->last_heard < 1000000) {
+        // Very small timestamp suggests time system issues
+        LOG_DEBUG("ARR: Node %s suspicious timestamp (%d) in no-time mode", node->user.short_name, node->last_heard);
+        return false;
+    }
+    
+    LOG_DEBUG("ARR: Node %s passes no-time activity check (SNR: %.1f, hops: %d)", 
+             node->user.short_name, node->snr, node->has_hops_away ? node->hops_away : 0);
+    return true;
+}
+
+bool ARRModule::isNodeDataReliable(const meshtastic_NodeInfoLite *node) const
+{
+    if (!node) {
+        return false;
+    }
+    
+    uint32_t nodeAge = getNodeAge(node);
+    RTCQuality timeQuality = getRTCQuality();
+    
+    // Handle the critical case where time functions return 0 or unreliable data
+    if (timeQuality == RTCQualityNone) {
+        LOG_DEBUG("ARR: No time quality available, using activity-based evaluation for %s", node->user.short_name);
+        return evaluateNodeActivityWithoutTime(node);
+    }
+    
+    // Special handling when nodeAge seems invalid (UINT32_MAX or impossibly large)
+    if (nodeAge == UINT32_MAX || nodeAge > (365 * 24 * 60 * 60)) {
+        LOG_DEBUG("ARR: Invalid node age (%d) for %s, using activity-based evaluation", nodeAge, node->user.short_name);
+        return evaluateNodeActivityWithoutTime(node);
+    }
+    
+    // With high-quality time (GPS/NTP), use strict age limits
+    if (timeQuality >= RTCQualityNTP) {
+        bool reliable = nodeAge <= STRONG_SIGNAL_TIMEOUT_SEC;
+        LOG_DEBUG("ARR: High-quality time check for %s: age=%ds, reliable=%s", 
+                 node->user.short_name, nodeAge, reliable ? "true" : "false");
+        return reliable;
+    }
+    
+    // With medium-quality time (network/device), be more lenient
+    if (timeQuality >= RTCQualityFromNet) {
+        bool reliable = nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 2);
+        LOG_DEBUG("ARR: Medium-quality time check for %s: age=%ds, reliable=%s", 
+                 node->user.short_name, nodeAge, reliable ? "true" : "false");
+        return reliable;
+    }
+    
+    // With poor time quality (device only), use alternative indicators
+    if (timeQuality == RTCQualityDevice) {
+        // Combine time-based check with activity indicators
+        bool timeOk = nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 4);
+        bool activityOk = evaluateNodeActivityWithoutTime(node);
+        bool reliable = timeOk && activityOk;
+        
+        LOG_DEBUG("ARR: Device-quality time check for %s: age=%ds, timeOk=%s, activityOk=%s, reliable=%s", 
+                 node->user.short_name, nodeAge, timeOk ? "true" : "false", 
+                 activityOk ? "true" : "false", reliable ? "true" : "false");
+        return reliable;
+    }
+    
+    // Fallback to activity-based evaluation
+    return evaluateNodeActivityWithoutTime(node);
+}
+
+bool ARRModule::addPriorityShortname(const char* shortname)
+{
+    if (!shortname) {
+        LOG_WARN("ARR: Null shortname provided");
+        return false;
+    }
+    return addPriorityShortname(String(shortname));
+}
+
+bool ARRModule::addPriorityShortname(const String& shortname)
+{
+    // Input validation
+    if (shortname.isEmpty() || shortname.length() > MAX_SHORTNAME_LENGTH) {
+        LOG_WARN("ARR: Invalid shortname length: %d (max: %d)", shortname.length(), MAX_SHORTNAME_LENGTH);
+        return false;
+    }
+    
+    if (priorityShortnames.size() >= MAX_PRIORITY_SHORTNAMES) {
+        LOG_WARN("ARR: Maximum priority nodes limit reached: %d", MAX_PRIORITY_SHORTNAMES);
+        return false;
+    }
+    
+    // Check if already exists (case-insensitive)
     for (const auto& existing : priorityShortnames) {
         if (existing.equalsIgnoreCase(shortname)) {
-            return;
+            LOG_DEBUG("ARR: Priority node already exists: %s", shortname.c_str());
+            return false;
         }
     }
     
     priorityShortnames.push_back(shortname);
+    LOG_INFO("ARR: Added priority node: %s (%d total)", shortname.c_str(), priorityShortnames.size());
+    return true;
 }
 
-void ARRModule::removePriorityShortname(const String& shortname)
+bool ARRModule::removePriorityShortname(const String& shortname)
 {
+    if (shortname.isEmpty()) {
+        return false;
+    }
+    
     for (auto it = priorityShortnames.begin(); it != priorityShortnames.end(); ++it) {
         if (it->equalsIgnoreCase(shortname)) {
             priorityShortnames.erase(it);
-            return;
+            LOG_INFO("ARR: Removed priority node: %s (%d remaining)", shortname.c_str(), priorityShortnames.size());
+            return true;
         }
     }
+    return false;
 }
 
 void ARRModule::clearPriorityShortnames()
 {
+    size_t count = priorityShortnames.size();
     priorityShortnames.clear();
+    LOG_INFO("ARR: Cleared %d priority nodes", count);
+}
+
+size_t ARRModule::getPriorityNodeCount() const
+{
+    return priorityShortnames.size();
 }
 
 void ARRModule::enableStatusBroadcast(bool enabled)
@@ -310,7 +531,7 @@ bool ARRModule::isStatusBroadcastEnabled() const
 
 void ARRModule::broadcastStatusMessage(const char* message)
 {
-    if (!statusBroadcastEnabled || !service || !router) {
+    if (!statusBroadcastEnabled || !service || !router || !message) {
         return;
     }
     
@@ -324,6 +545,7 @@ void ARRModule::broadcastStatusMessage(const char* message)
     // Allocate packet for sending
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p) {
+        LOG_WARN("ARR: Failed to allocate packet for status broadcast");
         return;
     }
     
@@ -334,10 +556,12 @@ void ARRModule::broadcastStatusMessage(const char* message)
     p->want_ack = false;  // Don't need acks for status messages
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;  // Low priority
     
-    // Copy message to payload
+    // Copy message to payload with bounds checking
     size_t len = strlen(message);
-    if (len > sizeof(p->decoded.payload.bytes) - 1) {
-        len = sizeof(p->decoded.payload.bytes) - 1;  // Truncate if too long
+    size_t maxPayload = sizeof(p->decoded.payload.bytes) - 1;
+    if (len > maxPayload) {
+        len = maxPayload;  // Truncate if too long
+        LOG_WARN("ARR: Status message truncated from %d to %d bytes", strlen(message), len);
     }
     memcpy(p->decoded.payload.bytes, message, len);
     p->decoded.payload.size = len;
@@ -348,24 +572,32 @@ void ARRModule::broadcastStatusMessage(const char* message)
 
 void ARRModule::broadcastRoleChange(bool wasMuted, bool nowMuted, const char* reason)
 {
-    if (!statusBroadcastEnabled) {
+    if (!statusBroadcastEnabled || !reason) {
         return;
     }
     
     // Get node info for creating the message
-    const meshtastic_NodeInfoLite *myNode = nodeDB->getMeshNodeByIndex(0);  // Our own node
-    String nodeId = "Unknown";
+    const meshtastic_NodeInfoLite *myNode = nodeDB ? nodeDB->getMeshNodeByIndex(0) : nullptr;  // Our own node
+    char nodeId[MAX_NODE_NAME_BUFFER] = "Unknown";
     if (myNode && myNode->has_user && myNode->user.short_name[0] != '\0') {
-        nodeId = String(myNode->user.short_name);
+        strncpy(nodeId, myNode->user.short_name, sizeof(nodeId) - 1);
+        nodeId[sizeof(nodeId) - 1] = '\0';  // Ensure null termination
     }
     
-    // Create role change message
-    char message[200];
-    snprintf(message, sizeof(message), "ARR %s: %s→%s (%s)", 
-             nodeId.c_str(),
-             wasMuted ? "MUTE" : "CLIENT",
-             nowMuted ? "MUTE" : "CLIENT",
-             reason);
+    // Create role change message with safe formatting
+    char message[MAX_MESSAGE_SIZE];
+    int result = snprintf(message, sizeof(message), "ARR %s: %s→%s (%s)", 
+                         nodeId,
+                         wasMuted ? "MUTE" : "CLIENT",
+                         nowMuted ? "MUTE" : "CLIENT",
+                         reason);
+    
+    if (result < 0 || result >= (int)sizeof(message)) {
+        LOG_WARN("ARR: Role change message formatting error or truncation");
+        // Use a fallback message
+        snprintf(message, sizeof(message), "ARR: Role change %s→%s", 
+                wasMuted ? "MUTE" : "CLIENT", nowMuted ? "MUTE" : "CLIENT");
+    }
     
     broadcastStatusMessage(message);
 }
@@ -376,33 +608,52 @@ void ARRModule::broadcastComprehensiveStatus()
         return;
     }
     
-    // Build comprehensive status message
-    char message[240];
-    char priorityInfo[100];
-    char routerInfo[100];
+    // Build comprehensive status message using stack allocation to avoid heap fragmentation
+    char message[MAX_MESSAGE_SIZE];
+    char priorityInfo[MAX_STATUS_BUFFER];
+    char routerInfo[MAX_STATUS_BUFFER];
     
     formatPriorityNodeStatus(priorityInfo, sizeof(priorityInfo));
     formatRouterAnalysis(routerInfo, sizeof(routerInfo));
     
     const char* currentRole = getCurrentMuteState() ? "MUTE" : "CLIENT";
     
-    snprintf(message, sizeof(message), "ARR: %s | %s | %s", 
-             currentRole, routerInfo, priorityInfo);
+    int result = snprintf(message, sizeof(message), "ARR: %s | %s | %s", 
+                         currentRole, routerInfo, priorityInfo);
+    
+    if (result < 0 || result >= (int)sizeof(message)) {
+        LOG_WARN("ARR: Comprehensive status message formatting error or truncation");
+        // Use a simpler fallback message
+        snprintf(message, sizeof(message), "ARR: %s | %d priority nodes", 
+                currentRole, (int)priorityShortnames.size());
+    }
     
     broadcastStatusMessage(message);
 }
 
 void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
 {
+    if (!buffer || bufSize == 0) {
+        return;
+    }
+    
     if (priorityShortnames.empty()) {
         snprintf(buffer, bufSize, "No priority nodes");
         return;
     }
     
-    String activeNodes = "";
-    String debugInfo = "";
+    if (!nodeDB || !nodeDB->meshNodes) {
+        snprintf(buffer, bufSize, "NodeDB unavailable");
+        return;
+    }
+    
+    // Use local char arrays instead of String to avoid heap allocation
+    char activeNodes[MAX_STATUS_BUFFER] = "";
+    char debugInfo[MAX_STATUS_BUFFER] = "";
     int activeCount = 0;
     int foundCount = 0;
+    size_t activeNodesLen = 0;
+    size_t debugInfoLen = 0;
     
     for (const auto& shortname : priorityShortnames) {
         for (int i = 0; i < nodeDB->numMeshNodes; i++) {
@@ -411,32 +662,67 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
             
             if (strcasecmp(node->user.short_name, shortname.c_str()) == 0) {
                 foundCount++;
-                uint32_t ageSeconds = sinceLastSeen_fromTimestamp(node->last_heard);
+                uint32_t ageSeconds = getNodeAge(node);
                 
-                // Check if active and strong enough for override
-                if (ageSeconds <= STRONG_SIGNAL_TIMEOUT_SEC && 
+                // Check if active and strong enough for override using improved reliability check
+                if (isNodeDataReliable(node) && 
                     node->snr >= STRONG_SIGNAL_OVERRIDE_SNR &&
                     !node->via_mqtt && 
                     (!node->has_hops_away || node->hops_away == 0)) {
                     
-                    if (activeCount > 0) activeNodes += ",";
-                    activeNodes += shortname;
-                    activeNodes += "(";
-                    activeNodes += String(node->snr, 1);
-                    activeNodes += "dB)";
+                    // Format active node info
+                    char nodeInfo[50];
+                    snprintf(nodeInfo, sizeof(nodeInfo), "%s%s(%.1fdB)",
+                            activeCount > 0 ? "," : "",
+                            shortname.c_str(),
+                            node->snr);
+                    
+                    if (activeNodesLen + strlen(nodeInfo) < sizeof(activeNodes) - 1) {
+                        strcat(activeNodes, nodeInfo);
+                        activeNodesLen += strlen(nodeInfo);
+                    }
                     activeCount++;
                 } else {
-                    // Add debug info for why it's not active
-                    if (debugInfo.length() > 0) debugInfo += ",";
-                    debugInfo += shortname;
-                    debugInfo += "(";
-                    debugInfo += String(node->snr, 1);
-                    debugInfo += "dB";
-                    if (ageSeconds > STRONG_SIGNAL_TIMEOUT_SEC) debugInfo += ",old";
-                    if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) debugInfo += ",weak";
-                    if (node->via_mqtt) debugInfo += ",mqtt";
-                    if (node->has_hops_away && node->hops_away > 0) debugInfo += ",multi-hop";
-                    debugInfo += ")";
+                    // Format debug info for inactive nodes with bounds checking
+                    char nodeDebug[80]; // Increased buffer size for time quality info
+                    int written = snprintf(nodeDebug, sizeof(nodeDebug), "%s%s(%.1fdB",
+                            foundCount > 1 ? "," : "",
+                            shortname.c_str(),
+                            node->snr);
+                    
+                    // Only append additional info if we have space (leave room for closing paren)
+                    if (written > 0 && written < (int)sizeof(nodeDebug) - 20) {
+                        if (ageSeconds > STRONG_SIGNAL_TIMEOUT_SEC) {
+                            strncat(nodeDebug, ",old", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) {
+                            strncat(nodeDebug, ",weak", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        if (node->via_mqtt) {
+                            strncat(nodeDebug, ",mqtt", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        if (node->has_hops_away && node->hops_away > 0) {
+                            strncat(nodeDebug, ",multi-hop", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        
+                        // Add time quality info for debugging
+                        RTCQuality quality = getRTCQuality();
+                        if (quality < RTCQualityFromNet) {
+                            strncat(nodeDebug, ",poor-time", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        strncat(nodeDebug, ")", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                    } else {
+                        // Fallback if buffer too small
+                        strncat(nodeDebug, "...)", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                    }
+                    
+                    // Ensure null termination
+                    nodeDebug[sizeof(nodeDebug) - 1] = '\0';
+                    
+                    if (debugInfoLen + strlen(nodeDebug) < sizeof(debugInfo) - 1) {
+                        strcat(debugInfo, nodeDebug);
+                        debugInfoLen += strlen(nodeDebug);
+                    }
                 }
                 break;
             }
@@ -444,10 +730,10 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
     }
     
     if (activeCount > 0) {
-        snprintf(buffer, bufSize, "Priority: %s", activeNodes.c_str());
+        snprintf(buffer, bufSize, "Priority: %s", activeNodes);
     } else if (foundCount > 0) {
         // Show debug info for found but inactive nodes
-        snprintf(buffer, bufSize, "Priority: %s (inactive)", debugInfo.c_str());
+        snprintf(buffer, bufSize, "Priority: %s (inactive)", debugInfo);
     } else {
         snprintf(buffer, bufSize, "Priority: none found");
     }
@@ -466,7 +752,7 @@ void ARRModule::formatRouterAnalysis(char* buffer, size_t bufSize)
 
 void ARRModule::requestNodeInfoFromStalePriorityNodes()
 {
-    if (!nodeInfoModule) {
+    if (!nodeInfoModule || !nodeDB) {
         return;
     }
     
@@ -483,16 +769,16 @@ void ARRModule::requestNodeInfoFromStalePriorityNodes()
             if (!node || !node->has_user) continue;
             
             if (strcasecmp(node->user.short_name, shortname.c_str()) == 0) {
-                uint32_t timeSinceHeard = sinceLastSeen_fromTimestamp(node->last_heard);
+                uint32_t timeSinceHeard = getNodeAge(node);
                 
-                // If node data is getting stale (more than 30 minutes old) but not ancient,
-                // and we haven't requested info recently, send a NodeInfo request
+                // If node data is getting stale but not ancient, and we haven't requested info recently
                 if (shouldRequestNodeInfo(node->num, timeSinceHeard)) {
                     // Send NodeInfo request with want_response=true to get fresh data
                     nodeInfoModule->sendOurNodeInfo(node->num, true, 0, true); // shorterTimeout=true
                     
                     // Record when we made this request
                     lastNodeInfoRequest[node->num] = now;
+                    LOG_DEBUG("ARR: Requested fresh info for priority node: %s", shortname.c_str());
                 }
                 break;
             }
@@ -503,13 +789,25 @@ void ARRModule::requestNodeInfoFromStalePriorityNodes()
 bool ARRModule::shouldRequestNodeInfo(NodeNum nodeId, uint32_t timeSinceHeard)
 {
     uint32_t now = millis();
+    RTCQuality timeQuality = getRTCQuality();
+    
+    // Adjust staleness thresholds based on time quality
+    uint32_t minStaleAge = STALE_NODE_MIN_AGE;
+    uint32_t maxStaleAge = STALE_NODE_MAX_AGE;
+    
+    // With poor time quality, be more aggressive about refreshing node info
+    if (timeQuality < RTCQualityFromNet) {
+        minStaleAge = STALE_NODE_MIN_AGE / 2;  // 15 minutes instead of 30
+        maxStaleAge = STALE_NODE_MAX_AGE / 2;  // 1 hour instead of 2
+        LOG_DEBUG("ARR: Using shorter staleness intervals due to poor time quality: %s", RtcName(timeQuality));
+    }
     
     // Only request if:
-    // 1. Node data is getting stale (30 minutes to 2 hours old)
+    // 1. Node data is getting stale (adjustable based on time quality)
     // 2. We haven't requested info from this node recently (2 minute cooldown)
     // 3. Node data isn't completely ancient (don't spam old nodes)
     
-    bool dataIsGettingStale = (timeSinceHeard > 30 * 60) && (timeSinceHeard < 2 * 60 * 60); // 30min - 2hr
+    bool dataIsGettingStale = (timeSinceHeard > minStaleAge) && (timeSinceHeard < maxStaleAge);
     
     auto lastRequestIt = lastNodeInfoRequest.find(nodeId);
     bool requestCooldownExpired = (lastRequestIt == lastNodeInfoRequest.end()) || 
