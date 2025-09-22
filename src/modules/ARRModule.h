@@ -106,8 +106,9 @@ private:
     void requestNodeInfoFromStalePriorityNodes();
     bool shouldRequestNodeInfo(NodeNum nodeId, uint32_t timeSinceHeard);
 
-    // Utility functions
-    uint32_t sinceLastSeen_fromTimestamp(uint32_t timestamp) const;
+    // Node data reliability assessment
+    bool isNodeDataReliable(const meshtastic_NodeInfoLite *node) const;
+    uint32_t getNodeAge(const meshtastic_NodeInfoLite *node) const;
     
     // Status broadcasting
     void broadcastStatusMessage(const char* message);

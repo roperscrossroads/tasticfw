@@ -104,12 +104,6 @@ int32_t ARRModule::runOnce()
 
 bool ARRModule::checkStrongSignalOverride()
 {
-    // Use validated time for priority override decisions to avoid false positives with bad clocks
-    uint32_t now = getValidTime(RTCQualityDevice);
-    if (now == 0) {
-        return false; // Can't make reliable time-based decisions without valid time
-    }
-    
     if (priorityShortnames.empty()) {
         return false; 
     }
@@ -120,6 +114,10 @@ bool ARRModule::checkStrongSignalOverride()
     }
     
     bool hasStrongSignal = false;
+    RTCQuality timeQuality = getRTCQuality();
+    
+    // Log time quality for debugging
+    LOG_DEBUG("ARR: Evaluating with time quality: %s", RtcName(timeQuality));
 
     for (int i = 0; i < nodeDB->numMeshNodes; i++) {
         auto node = nodeDB->getMeshNodeByIndex(i);
@@ -138,24 +136,37 @@ bool ARRModule::checkStrongSignalOverride()
 
         // DIRECT LINKS ONLY: Skip MQTT and multi-hop messages
         if (node->via_mqtt) {
+            LOG_DEBUG("ARR: Skipping MQTT node %s", node->user.short_name);
             continue;
         }
         
         if (node->has_hops_away && node->hops_away > 0) {
+            LOG_DEBUG("ARR: Skipping multi-hop node %s (hops: %d)", node->user.short_name, node->hops_away);
             continue;
         }
 
-        // Check if node is recently heard and has strong signal
-        uint32_t timeSinceHeard = sinceLastSeen_fromTimestamp(node->last_heard);
-        if (timeSinceHeard > STRONG_SIGNAL_TIMEOUT_SEC) {
+        // Use improved node data reliability assessment
+        if (!isNodeDataReliable(node)) {
+            LOG_DEBUG("ARR: Node %s data not reliable (age: %ds, quality: %s)", 
+                     node->user.short_name, getNodeAge(node), RtcName(timeQuality));
             continue;
         }
 
-        // Check SNR threshold - now we can trust it since it's a direct link
+        // Check SNR threshold - now we can trust it since it's a direct link with reliable data
         if (node->snr >= STRONG_SIGNAL_OVERRIDE_SNR) {
             hasStrongSignal = true;
-            lastStrongSignalOverride = now;
+            // Use current valid time if available, otherwise use millis() for tracking
+            if (timeQuality >= RTCQualityFromNet) {
+                lastStrongSignalOverride = getValidTime(RTCQualityFromNet);
+            } else {
+                lastStrongSignalOverride = millis() / 1000; // Convert to seconds for consistency
+            }
+            LOG_INFO("ARR: Strong signal detected from priority node %s (SNR: %.1fdB)", 
+                    node->user.short_name, node->snr);
             break; // One strong signal is enough
+        } else {
+            LOG_DEBUG("ARR: Priority node %s signal too weak (SNR: %.1fdB < %.1fdB)", 
+                     node->user.short_name, node->snr, STRONG_SIGNAL_OVERRIDE_SNR);
         }
     }
 
@@ -215,8 +226,8 @@ bool ARRModule::isValidRouter(const meshtastic_NodeInfoLite *node) const
         return false;
     }
 
-    // Must be recently active (15 minutes)
-    if (sinceLastSeen_fromTimestamp(node->last_heard) > ROUTER_TIMEOUT_SEC) {
+    // Must be recently active (15 minutes) - use NodeDB's method
+    if (getNodeAge(node) > ROUTER_TIMEOUT_SEC) {
         return false;
     }
 
@@ -281,15 +292,46 @@ uint32_t ARRModule::getNextCheckInterval()
     return networkIsStable ? EVALUATION_INTERVAL : FAST_CHECK_INTERVAL;
 }
 
-uint32_t ARRModule::sinceLastSeen_fromTimestamp(uint32_t timestamp) const
+uint32_t ARRModule::getNodeAge(const meshtastic_NodeInfoLite *node) const
 {
-    uint32_t now = getTime(); // Use same time source as NodeDB's sinceLastSeen()
+    if (!node) {
+        return UINT32_MAX; // Invalid node is considered infinitely old
+    }
     
-    int delta = (int)(now - timestamp);
-    if (delta < 0) // Handle clock drift - same as NodeDB implementation
-        delta = 0;
-        
-    return delta;
+    // Use NodeDB's built-in method which handles time quality and clock drift properly
+    return sinceLastSeen(node);
+}
+
+bool ARRModule::isNodeDataReliable(const meshtastic_NodeInfoLite *node) const
+{
+    if (!node) {
+        return false;
+    }
+    
+    uint32_t nodeAge = getNodeAge(node);
+    RTCQuality timeQuality = getRTCQuality();
+    
+    // With high-quality time (GPS/NTP), use strict age limits
+    if (timeQuality >= RTCQualityNTP) {
+        return nodeAge <= STRONG_SIGNAL_TIMEOUT_SEC;
+    }
+    
+    // With medium-quality time (network/device), be more lenient
+    if (timeQuality >= RTCQualityFromNet) {
+        return nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 2); // Double the timeout
+    }
+    
+    // With poor time quality, use alternative indicators
+    // - Recent SNR data suggests active communication
+    // - Low hop count suggests direct connectivity
+    if (timeQuality == RTCQualityDevice || timeQuality == RTCQualityNone) {
+        // Be very lenient with timing, focus on signal quality
+        return (nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 4)) && 
+               (node->snr > -20.0f) && // Reasonable signal strength
+               (!node->has_hops_away || node->hops_away <= 1); // Direct or 1-hop
+    }
+    
+    return false;
 }
 
 bool ARRModule::addPriorityShortname(const String& shortname)
@@ -489,10 +531,10 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
             
             if (strcasecmp(node->user.short_name, shortname.c_str()) == 0) {
                 foundCount++;
-                uint32_t ageSeconds = sinceLastSeen_fromTimestamp(node->last_heard);
+                uint32_t ageSeconds = getNodeAge(node);
                 
-                // Check if active and strong enough for override
-                if (ageSeconds <= STRONG_SIGNAL_TIMEOUT_SEC && 
+                // Check if active and strong enough for override using improved reliability check
+                if (isNodeDataReliable(node) && 
                     node->snr >= STRONG_SIGNAL_OVERRIDE_SNR &&
                     !node->via_mqtt && 
                     (!node->has_hops_away || node->hops_away == 0)) {
@@ -511,7 +553,7 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
                     activeCount++;
                 } else {
                     // Format debug info for inactive nodes
-                    char nodeDebug[60];
+                    char nodeDebug[80]; // Increased buffer size for time quality info
                     snprintf(nodeDebug, sizeof(nodeDebug), "%s%s(%.1fdB",
                             foundCount > 1 ? "," : "",
                             shortname.c_str(),
@@ -521,6 +563,12 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
                     if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) strcat(nodeDebug, ",weak");
                     if (node->via_mqtt) strcat(nodeDebug, ",mqtt");
                     if (node->has_hops_away && node->hops_away > 0) strcat(nodeDebug, ",multi-hop");
+                    
+                    // Add time quality info for debugging
+                    RTCQuality quality = getRTCQuality();
+                    if (quality < RTCQualityFromNet) {
+                        strcat(nodeDebug, ",poor-time");
+                    }
                     strcat(nodeDebug, ")");
                     
                     if (debugInfoLen + strlen(nodeDebug) < sizeof(debugInfo) - 1) {
@@ -573,10 +621,9 @@ void ARRModule::requestNodeInfoFromStalePriorityNodes()
             if (!node || !node->has_user) continue;
             
             if (strcasecmp(node->user.short_name, shortname.c_str()) == 0) {
-                uint32_t timeSinceHeard = sinceLastSeen_fromTimestamp(node->last_heard);
+                uint32_t timeSinceHeard = getNodeAge(node);
                 
-                // If node data is getting stale (more than 30 minutes old) but not ancient,
-                // and we haven't requested info recently, send a NodeInfo request
+                // If node data is getting stale but not ancient, and we haven't requested info recently
                 if (shouldRequestNodeInfo(node->num, timeSinceHeard)) {
                     // Send NodeInfo request with want_response=true to get fresh data
                     nodeInfoModule->sendOurNodeInfo(node->num, true, 0, true); // shorterTimeout=true
@@ -594,13 +641,25 @@ void ARRModule::requestNodeInfoFromStalePriorityNodes()
 bool ARRModule::shouldRequestNodeInfo(NodeNum nodeId, uint32_t timeSinceHeard)
 {
     uint32_t now = millis();
+    RTCQuality timeQuality = getRTCQuality();
+    
+    // Adjust staleness thresholds based on time quality
+    uint32_t minStaleAge = STALE_NODE_MIN_AGE;
+    uint32_t maxStaleAge = STALE_NODE_MAX_AGE;
+    
+    // With poor time quality, be more aggressive about refreshing node info
+    if (timeQuality < RTCQualityFromNet) {
+        minStaleAge = STALE_NODE_MIN_AGE / 2;  // 15 minutes instead of 30
+        maxStaleAge = STALE_NODE_MAX_AGE / 2;  // 1 hour instead of 2
+        LOG_DEBUG("ARR: Using shorter staleness intervals due to poor time quality: %s", RtcName(timeQuality));
+    }
     
     // Only request if:
-    // 1. Node data is getting stale (30 minutes to 2 hours old)
+    // 1. Node data is getting stale (adjustable based on time quality)
     // 2. We haven't requested info from this node recently (2 minute cooldown)
     // 3. Node data isn't completely ancient (don't spam old nodes)
     
-    bool dataIsGettingStale = (timeSinceHeard > STALE_NODE_MIN_AGE) && (timeSinceHeard < STALE_NODE_MAX_AGE);
+    bool dataIsGettingStale = (timeSinceHeard > minStaleAge) && (timeSinceHeard < maxStaleAge);
     
     auto lastRequestIt = lastNodeInfoRequest.find(nodeId);
     bool requestCooldownExpired = (lastRequestIt == lastNodeInfoRequest.end()) || 
