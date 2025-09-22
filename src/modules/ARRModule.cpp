@@ -468,7 +468,7 @@ bool ARRModule::addPriorityShortname(const char* shortname)
 bool ARRModule::addPriorityShortname(const String& shortname)
 {
     // Input validation
-    if (shortname.isEmpty() || shortname.length() > MAX_SHORTNAME_LENGTH) {
+    if (shortname.length() == 0 || shortname.length() > MAX_SHORTNAME_LENGTH) {
         LOG_WARN("ARR: Invalid shortname length: %d (max: %d)", shortname.length(), MAX_SHORTNAME_LENGTH);
         return false;
     }
@@ -493,7 +493,7 @@ bool ARRModule::addPriorityShortname(const String& shortname)
 
 bool ARRModule::removePriorityShortname(const String& shortname)
 {
-    if (shortname.isEmpty()) {
+    if (shortname.length() == 0) {
         return false;
     }
     
