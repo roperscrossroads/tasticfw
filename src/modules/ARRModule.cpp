@@ -23,14 +23,18 @@ ARRModule::ARRModule()
         
         moduleEnabled = true;
         
-        // Hardcoded priority shortnames for testing
-        priorityShortnames.push_back("rxr1");
-        priorityShortnames.push_back("CSR1");
-        priorityShortnames.push_back("7e4c");
-        priorityShortnames.push_back("WOLF");
-        priorityShortnames.push_back("TCMQ");
-        priorityShortnames.push_back("CSR5");
-        priorityShortnames.push_back("CS11");
+        // TODO: Load priority shortnames from configuration instead of hardcoding
+        // For now, keep the test configuration but add validation
+        const char* defaultPriorityNodes[] = {
+            "rxr1", "CSR1", "7e4c", "WOLF", "TCMQ", "CSR5", "CS11"
+        };
+        
+        LOG_WARN("ARR: Using hardcoded priority nodes (should be configurable)");
+        for (size_t i = 0; i < sizeof(defaultPriorityNodes) / sizeof(defaultPriorityNodes[0]); i++) {
+            if (!addPriorityShortname(String(defaultPriorityNodes[i]))) {
+                LOG_WARN("ARR: Failed to add priority node: %s", defaultPriorityNodes[i]);
+            }
+        }
         
         // Start with a short delay to let the mesh settle
         setIntervalFromNow(30 * 1000); // 30 seconds initial delay
@@ -43,6 +47,7 @@ ARRModule::ARRModule()
 int32_t ARRModule::runOnce()
 {
     if (!moduleEnabled) {
+        LOG_WARN("ARR: runOnce called on disabled module");
         return EVALUATION_INTERVAL; // Shouldn't happen, but safety check
     }
 
@@ -50,14 +55,17 @@ int32_t ARRModule::runOnce()
     
     // Only do full evaluation every EVALUATION_INTERVAL
     if (now - lastEvaluation < EVALUATION_INTERVAL) {
-        return 30 * 1000; // Check again in 30 seconds
+        return FAST_CHECK_INTERVAL; // Check again sooner rather than using magic number
     }
     
     evaluationCount++;
     lastEvaluation = now;
     
+    LOG_DEBUG("ARR: Starting evaluation #%d", evaluationCount);
+    
     // Always respect minimum role change interval
     if (shouldDelayRoleChange()) {
+        LOG_DEBUG("ARR: Role change delayed due to cooldown");
         return getNextCheckInterval();
     }
 
@@ -105,11 +113,17 @@ bool ARRModule::checkStrongSignalOverride()
     if (priorityShortnames.empty()) {
         return false; 
     }
+    
+    if (!nodeDB || !nodeDB->meshNodes) {
+        LOG_WARN("ARR: NodeDB not available");
+        return false;
+    }
+    
     bool hasStrongSignal = false;
 
     for (int i = 0; i < nodeDB->numMeshNodes; i++) {
         auto node = nodeDB->getMeshNodeByIndex(i);
-        if (!node) continue;
+        if (!node || !node->has_user) continue;
 
         // Check if this is a priority node
         bool isPriorityNode = false;
@@ -153,6 +167,12 @@ void ARRModule::refreshRouterCache()
 {
     cachedRouters.clear();
     totalRouterCount = 0;
+    
+    if (!nodeDB || !nodeDB->meshNodes) {
+        LOG_WARN("ARR: NodeDB not available for router cache refresh");
+        return;
+    }
+    
     uint32_t now = getTime(); // Use consistent time source with sinceLastSeen()
 
     for (int i = 0; i < nodeDB->numMeshNodes; i++) {
@@ -181,6 +201,7 @@ void ARRModule::refreshRouterCache()
     }
 
     lastNodeDBUpdate = nodeDB->meshNodes->size();
+    LOG_DEBUG("ARR: Router cache refreshed: %d routers found", totalRouterCount);
 }
 
 bool ARRModule::isValidRouter(const meshtastic_NodeInfoLite *node) const
@@ -271,31 +292,58 @@ uint32_t ARRModule::sinceLastSeen_fromTimestamp(uint32_t timestamp) const
     return delta;
 }
 
-void ARRModule::addPriorityShortname(const String& shortname)
+bool ARRModule::addPriorityShortname(const String& shortname)
 {
-    // Check if already exists
+    // Input validation
+    if (shortname.isEmpty() || shortname.length() > MAX_SHORTNAME_LENGTH) {
+        LOG_WARN("ARR: Invalid shortname length: %d (max: %d)", shortname.length(), MAX_SHORTNAME_LENGTH);
+        return false;
+    }
+    
+    if (priorityShortnames.size() >= MAX_PRIORITY_SHORTNAMES) {
+        LOG_WARN("ARR: Maximum priority nodes limit reached: %d", MAX_PRIORITY_SHORTNAMES);
+        return false;
+    }
+    
+    // Check if already exists (case-insensitive)
     for (const auto& existing : priorityShortnames) {
         if (existing.equalsIgnoreCase(shortname)) {
-            return;
+            LOG_DEBUG("ARR: Priority node already exists: %s", shortname.c_str());
+            return false;
         }
     }
     
     priorityShortnames.push_back(shortname);
+    LOG_INFO("ARR: Added priority node: %s (%d total)", shortname.c_str(), priorityShortnames.size());
+    return true;
 }
 
-void ARRModule::removePriorityShortname(const String& shortname)
+bool ARRModule::removePriorityShortname(const String& shortname)
 {
+    if (shortname.isEmpty()) {
+        return false;
+    }
+    
     for (auto it = priorityShortnames.begin(); it != priorityShortnames.end(); ++it) {
         if (it->equalsIgnoreCase(shortname)) {
             priorityShortnames.erase(it);
-            return;
+            LOG_INFO("ARR: Removed priority node: %s (%d remaining)", shortname.c_str(), priorityShortnames.size());
+            return true;
         }
     }
+    return false;
 }
 
 void ARRModule::clearPriorityShortnames()
 {
+    size_t count = priorityShortnames.size();
     priorityShortnames.clear();
+    LOG_INFO("ARR: Cleared %d priority nodes", count);
+}
+
+size_t ARRModule::getPriorityNodeCount() const
+{
+    return priorityShortnames.size();
 }
 
 void ARRModule::enableStatusBroadcast(bool enabled)
@@ -310,7 +358,7 @@ bool ARRModule::isStatusBroadcastEnabled() const
 
 void ARRModule::broadcastStatusMessage(const char* message)
 {
-    if (!statusBroadcastEnabled || !service || !router) {
+    if (!statusBroadcastEnabled || !service || !router || !message) {
         return;
     }
     
@@ -324,6 +372,7 @@ void ARRModule::broadcastStatusMessage(const char* message)
     // Allocate packet for sending
     meshtastic_MeshPacket *p = router->allocForSending();
     if (!p) {
+        LOG_WARN("ARR: Failed to allocate packet for status broadcast");
         return;
     }
     
@@ -334,10 +383,12 @@ void ARRModule::broadcastStatusMessage(const char* message)
     p->want_ack = false;  // Don't need acks for status messages
     p->priority = meshtastic_MeshPacket_Priority_BACKGROUND;  // Low priority
     
-    // Copy message to payload
+    // Copy message to payload with bounds checking
     size_t len = strlen(message);
-    if (len > sizeof(p->decoded.payload.bytes) - 1) {
-        len = sizeof(p->decoded.payload.bytes) - 1;  // Truncate if too long
+    size_t maxPayload = sizeof(p->decoded.payload.bytes) - 1;
+    if (len > maxPayload) {
+        len = maxPayload;  // Truncate if too long
+        LOG_WARN("ARR: Status message truncated from %d to %d bytes", strlen(message), len);
     }
     memcpy(p->decoded.payload.bytes, message, len);
     p->decoded.payload.size = len;
@@ -348,24 +399,32 @@ void ARRModule::broadcastStatusMessage(const char* message)
 
 void ARRModule::broadcastRoleChange(bool wasMuted, bool nowMuted, const char* reason)
 {
-    if (!statusBroadcastEnabled) {
+    if (!statusBroadcastEnabled || !reason) {
         return;
     }
     
     // Get node info for creating the message
-    const meshtastic_NodeInfoLite *myNode = nodeDB->getMeshNodeByIndex(0);  // Our own node
-    String nodeId = "Unknown";
+    const meshtastic_NodeInfoLite *myNode = nodeDB ? nodeDB->getMeshNodeByIndex(0) : nullptr;  // Our own node
+    char nodeId[MAX_NODE_NAME_BUFFER] = "Unknown";
     if (myNode && myNode->has_user && myNode->user.short_name[0] != '\0') {
-        nodeId = String(myNode->user.short_name);
+        strncpy(nodeId, myNode->user.short_name, sizeof(nodeId) - 1);
+        nodeId[sizeof(nodeId) - 1] = '\0';  // Ensure null termination
     }
     
-    // Create role change message
-    char message[200];
-    snprintf(message, sizeof(message), "ARR %s: %s→%s (%s)", 
-             nodeId.c_str(),
-             wasMuted ? "MUTE" : "CLIENT",
-             nowMuted ? "MUTE" : "CLIENT",
-             reason);
+    // Create role change message with safe formatting
+    char message[MAX_MESSAGE_SIZE];
+    int result = snprintf(message, sizeof(message), "ARR %s: %s→%s (%s)", 
+                         nodeId,
+                         wasMuted ? "MUTE" : "CLIENT",
+                         nowMuted ? "MUTE" : "CLIENT",
+                         reason);
+    
+    if (result < 0 || result >= (int)sizeof(message)) {
+        LOG_WARN("ARR: Role change message formatting error or truncation");
+        // Use a fallback message
+        snprintf(message, sizeof(message), "ARR: Role change %s→%s", 
+                wasMuted ? "MUTE" : "CLIENT", nowMuted ? "MUTE" : "CLIENT");
+    }
     
     broadcastStatusMessage(message);
 }
@@ -376,33 +435,52 @@ void ARRModule::broadcastComprehensiveStatus()
         return;
     }
     
-    // Build comprehensive status message
-    char message[240];
-    char priorityInfo[100];
-    char routerInfo[100];
+    // Build comprehensive status message using stack allocation to avoid heap fragmentation
+    char message[MAX_MESSAGE_SIZE];
+    char priorityInfo[MAX_STATUS_BUFFER];
+    char routerInfo[MAX_STATUS_BUFFER];
     
     formatPriorityNodeStatus(priorityInfo, sizeof(priorityInfo));
     formatRouterAnalysis(routerInfo, sizeof(routerInfo));
     
     const char* currentRole = getCurrentMuteState() ? "MUTE" : "CLIENT";
     
-    snprintf(message, sizeof(message), "ARR: %s | %s | %s", 
-             currentRole, routerInfo, priorityInfo);
+    int result = snprintf(message, sizeof(message), "ARR: %s | %s | %s", 
+                         currentRole, routerInfo, priorityInfo);
+    
+    if (result < 0 || result >= (int)sizeof(message)) {
+        LOG_WARN("ARR: Comprehensive status message formatting error or truncation");
+        // Use a simpler fallback message
+        snprintf(message, sizeof(message), "ARR: %s | %d priority nodes", 
+                currentRole, (int)priorityShortnames.size());
+    }
     
     broadcastStatusMessage(message);
 }
 
 void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
 {
+    if (!buffer || bufSize == 0) {
+        return;
+    }
+    
     if (priorityShortnames.empty()) {
         snprintf(buffer, bufSize, "No priority nodes");
         return;
     }
     
-    String activeNodes = "";
-    String debugInfo = "";
+    if (!nodeDB || !nodeDB->meshNodes) {
+        snprintf(buffer, bufSize, "NodeDB unavailable");
+        return;
+    }
+    
+    // Use local char arrays instead of String to avoid heap allocation
+    char activeNodes[MAX_STATUS_BUFFER] = "";
+    char debugInfo[MAX_STATUS_BUFFER] = "";
     int activeCount = 0;
     int foundCount = 0;
+    size_t activeNodesLen = 0;
+    size_t debugInfoLen = 0;
     
     for (const auto& shortname : priorityShortnames) {
         for (int i = 0; i < nodeDB->numMeshNodes; i++) {
@@ -419,24 +497,36 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
                     !node->via_mqtt && 
                     (!node->has_hops_away || node->hops_away == 0)) {
                     
-                    if (activeCount > 0) activeNodes += ",";
-                    activeNodes += shortname;
-                    activeNodes += "(";
-                    activeNodes += String(node->snr, 1);
-                    activeNodes += "dB)";
+                    // Format active node info
+                    char nodeInfo[50];
+                    snprintf(nodeInfo, sizeof(nodeInfo), "%s%s(%.1fdB)",
+                            activeCount > 0 ? "," : "",
+                            shortname.c_str(),
+                            node->snr);
+                    
+                    if (activeNodesLen + strlen(nodeInfo) < sizeof(activeNodes) - 1) {
+                        strcat(activeNodes, nodeInfo);
+                        activeNodesLen += strlen(nodeInfo);
+                    }
                     activeCount++;
                 } else {
-                    // Add debug info for why it's not active
-                    if (debugInfo.length() > 0) debugInfo += ",";
-                    debugInfo += shortname;
-                    debugInfo += "(";
-                    debugInfo += String(node->snr, 1);
-                    debugInfo += "dB";
-                    if (ageSeconds > STRONG_SIGNAL_TIMEOUT_SEC) debugInfo += ",old";
-                    if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) debugInfo += ",weak";
-                    if (node->via_mqtt) debugInfo += ",mqtt";
-                    if (node->has_hops_away && node->hops_away > 0) debugInfo += ",multi-hop";
-                    debugInfo += ")";
+                    // Format debug info for inactive nodes
+                    char nodeDebug[60];
+                    snprintf(nodeDebug, sizeof(nodeDebug), "%s%s(%.1fdB",
+                            foundCount > 1 ? "," : "",
+                            shortname.c_str(),
+                            node->snr);
+                    
+                    if (ageSeconds > STRONG_SIGNAL_TIMEOUT_SEC) strcat(nodeDebug, ",old");
+                    if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) strcat(nodeDebug, ",weak");
+                    if (node->via_mqtt) strcat(nodeDebug, ",mqtt");
+                    if (node->has_hops_away && node->hops_away > 0) strcat(nodeDebug, ",multi-hop");
+                    strcat(nodeDebug, ")");
+                    
+                    if (debugInfoLen + strlen(nodeDebug) < sizeof(debugInfo) - 1) {
+                        strcat(debugInfo, nodeDebug);
+                        debugInfoLen += strlen(nodeDebug);
+                    }
                 }
                 break;
             }
@@ -444,10 +534,10 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
     }
     
     if (activeCount > 0) {
-        snprintf(buffer, bufSize, "Priority: %s", activeNodes.c_str());
+        snprintf(buffer, bufSize, "Priority: %s", activeNodes);
     } else if (foundCount > 0) {
         // Show debug info for found but inactive nodes
-        snprintf(buffer, bufSize, "Priority: %s (inactive)", debugInfo.c_str());
+        snprintf(buffer, bufSize, "Priority: %s (inactive)", debugInfo);
     } else {
         snprintf(buffer, bufSize, "Priority: none found");
     }
@@ -466,7 +556,7 @@ void ARRModule::formatRouterAnalysis(char* buffer, size_t bufSize)
 
 void ARRModule::requestNodeInfoFromStalePriorityNodes()
 {
-    if (!nodeInfoModule) {
+    if (!nodeInfoModule || !nodeDB) {
         return;
     }
     
@@ -493,6 +583,7 @@ void ARRModule::requestNodeInfoFromStalePriorityNodes()
                     
                     // Record when we made this request
                     lastNodeInfoRequest[node->num] = now;
+                    LOG_DEBUG("ARR: Requested fresh info for priority node: %s", shortname.c_str());
                 }
                 break;
             }
@@ -509,7 +600,7 @@ bool ARRModule::shouldRequestNodeInfo(NodeNum nodeId, uint32_t timeSinceHeard)
     // 2. We haven't requested info from this node recently (2 minute cooldown)
     // 3. Node data isn't completely ancient (don't spam old nodes)
     
-    bool dataIsGettingStale = (timeSinceHeard > 30 * 60) && (timeSinceHeard < 2 * 60 * 60); // 30min - 2hr
+    bool dataIsGettingStale = (timeSinceHeard > STALE_NODE_MIN_AGE) && (timeSinceHeard < STALE_NODE_MAX_AGE);
     
     auto lastRequestIt = lastNodeInfoRequest.find(nodeId);
     bool requestCooldownExpired = (lastRequestIt == lastNodeInfoRequest.end()) || 
