@@ -1,6 +1,7 @@
 #include "ARRModule.h"
 #include "MeshService.h"
 #include "NodeDB.h" 
+#include "NodeStatus.h"
 #include "RTC.h"
 #include "main.h"
 #include "modules/NodeInfoModule.h"
@@ -8,6 +9,7 @@
 #include "mesh/Router.h"
 #include <cstring>
 #include <map>
+#include <algorithm> // For std::find if needed
 
 extern Router *router;
 
@@ -24,7 +26,12 @@ ARRModule::ARRModule()
         moduleEnabled = true;
         
         // Set up NodeStatus observer for immediate node updates
-        nodeStatusObserver.observe(&nodeStatus->onNewStatus);
+        if (nodeStatus) {
+            nodeStatusObserver.observe(&nodeStatus->onNewStatus);
+            LOG_DEBUG("ARR: NodeStatus observer initialized");
+        } else {
+            LOG_WARN("ARR: nodeStatus not available during initialization");
+        }
         
         // TODO: Load priority shortnames from configuration instead of hardcoding
         // For now, keep the test configuration but add validation
@@ -34,7 +41,7 @@ ARRModule::ARRModule()
         
         LOG_WARN("ARR: Using hardcoded priority nodes (should be configurable)");
         for (size_t i = 0; i < sizeof(defaultPriorityNodes) / sizeof(defaultPriorityNodes[0]); i++) {
-            if (!addPriorityShortname(String(defaultPriorityNodes[i]))) {
+            if (!addPriorityShortname(defaultPriorityNodes[i])) {
                 LOG_WARN("ARR: Failed to add priority node: %s", defaultPriorityNodes[i]);
             }
         }
@@ -309,7 +316,7 @@ bool ARRModule::shouldDelayRoleChange() const
     return false; // Cooldown expired
 }
 
-uint32_t ARRModule::getNextCheckInterval()
+uint32_t ARRModule::getNextCheckInterval() const
 {
     // Use faster checks when network seems unstable
     return networkIsStable ? EVALUATION_INTERVAL : FAST_CHECK_INTERVAL;
@@ -317,6 +324,10 @@ uint32_t ARRModule::getNextCheckInterval()
 
 int ARRModule::onNodeStatusUpdate(const meshtastic::Status *newStatus)
 {
+    if (!newStatus || !moduleEnabled) {
+        return 0; // Ignore invalid updates or when module disabled
+    }
+    
     // React immediately to node database changes
     lastNodeUpdate = millis();
     pendingEvaluation = true;
@@ -443,6 +454,15 @@ bool ARRModule::isNodeDataReliable(const meshtastic_NodeInfoLite *node) const
     
     // Fallback to activity-based evaluation
     return evaluateNodeActivityWithoutTime(node);
+}
+
+bool ARRModule::addPriorityShortname(const char* shortname)
+{
+    if (!shortname) {
+        LOG_WARN("ARR: Null shortname provided");
+        return false;
+    }
+    return addPriorityShortname(String(shortname));
 }
 
 bool ARRModule::addPriorityShortname(const String& shortname)
@@ -663,24 +683,41 @@ void ARRModule::formatPriorityNodeStatus(char* buffer, size_t bufSize)
                     }
                     activeCount++;
                 } else {
-                    // Format debug info for inactive nodes
+                    // Format debug info for inactive nodes with bounds checking
                     char nodeDebug[80]; // Increased buffer size for time quality info
-                    snprintf(nodeDebug, sizeof(nodeDebug), "%s%s(%.1fdB",
+                    int written = snprintf(nodeDebug, sizeof(nodeDebug), "%s%s(%.1fdB",
                             foundCount > 1 ? "," : "",
                             shortname.c_str(),
                             node->snr);
                     
-                    if (ageSeconds > STRONG_SIGNAL_TIMEOUT_SEC) strcat(nodeDebug, ",old");
-                    if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) strcat(nodeDebug, ",weak");
-                    if (node->via_mqtt) strcat(nodeDebug, ",mqtt");
-                    if (node->has_hops_away && node->hops_away > 0) strcat(nodeDebug, ",multi-hop");
-                    
-                    // Add time quality info for debugging
-                    RTCQuality quality = getRTCQuality();
-                    if (quality < RTCQualityFromNet) {
-                        strcat(nodeDebug, ",poor-time");
+                    // Only append additional info if we have space (leave room for closing paren)
+                    if (written > 0 && written < (int)sizeof(nodeDebug) - 20) {
+                        if (ageSeconds > STRONG_SIGNAL_TIMEOUT_SEC) {
+                            strncat(nodeDebug, ",old", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        if (node->snr < STRONG_SIGNAL_OVERRIDE_SNR) {
+                            strncat(nodeDebug, ",weak", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        if (node->via_mqtt) {
+                            strncat(nodeDebug, ",mqtt", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        if (node->has_hops_away && node->hops_away > 0) {
+                            strncat(nodeDebug, ",multi-hop", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        
+                        // Add time quality info for debugging
+                        RTCQuality quality = getRTCQuality();
+                        if (quality < RTCQualityFromNet) {
+                            strncat(nodeDebug, ",poor-time", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                        }
+                        strncat(nodeDebug, ")", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
+                    } else {
+                        // Fallback if buffer too small
+                        strncat(nodeDebug, "...)", sizeof(nodeDebug) - strlen(nodeDebug) - 1);
                     }
-                    strcat(nodeDebug, ")");
+                    
+                    // Ensure null termination
+                    nodeDebug[sizeof(nodeDebug) - 1] = '\0';
                     
                     if (debugInfoLen + strlen(nodeDebug) < sizeof(debugInfo) - 1) {
                         strcat(debugInfo, nodeDebug);

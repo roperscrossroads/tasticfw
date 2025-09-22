@@ -109,7 +109,7 @@ private:
     bool checkStrongSignalOverride();
     bool getCurrentMuteState() const;
     void applyMuteDecision(bool shouldMute, const char* reason);
-    uint32_t getNextCheckInterval();
+    uint32_t getNextCheckInterval() const;
     
     // Priority node refresh
     void requestNodeInfoFromStalePriorityNodes();
@@ -142,6 +142,7 @@ public:
      * @return true if successful, false if invalid or limit reached
      */
     bool addPriorityShortname(const String& shortname);
+    bool addPriorityShortname(const char* shortname);
     
     /**
      * Remove a priority node from the list
