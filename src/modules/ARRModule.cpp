@@ -23,6 +23,9 @@ ARRModule::ARRModule()
         
         moduleEnabled = true;
         
+        // Set up NodeStatus observer for immediate node updates
+        nodeStatusObserver.observe(&nodeStatus->onNewStatus);
+        
         // TODO: Load priority shortnames from configuration instead of hardcoding
         // For now, keep the test configuration but add validation
         const char* defaultPriorityNodes[] = {
@@ -53,15 +56,20 @@ int32_t ARRModule::runOnce()
 
     uint32_t now = millis();
     
-    // Only do full evaluation every EVALUATION_INTERVAL
-    if (now - lastEvaluation < EVALUATION_INTERVAL) {
+    // Check if we should do an evaluation due to node status updates
+    bool shouldEvaluate = pendingEvaluation || (now - lastEvaluation >= EVALUATION_INTERVAL);
+    
+    if (!shouldEvaluate) {
         return FAST_CHECK_INTERVAL; // Check again sooner rather than using magic number
     }
     
     evaluationCount++;
     lastEvaluation = now;
+    bool wasTriggeredByUpdate = pendingEvaluation;
+    pendingEvaluation = false; // Clear the pending flag
     
-    LOG_DEBUG("ARR: Starting evaluation #%d", evaluationCount);
+    LOG_DEBUG("ARR: Starting evaluation #%d (triggered by: %s)", 
+             evaluationCount, wasTriggeredByUpdate ? "node update" : "timer");
     
     // Always respect minimum role change interval
     if (shouldDelayRoleChange()) {
@@ -119,6 +127,18 @@ bool ARRModule::checkStrongSignalOverride()
     // Log time quality for debugging
     LOG_DEBUG("ARR: Evaluating with time quality: %s", RtcName(timeQuality));
 
+    // Handle the critical case where time functions might return 0
+    uint32_t currentTime = 0;
+    bool timeIsReliable = false;
+    
+    if (timeQuality >= RTCQualityFromNet) {
+        currentTime = getValidTime(RTCQualityFromNet);
+        timeIsReliable = (currentTime != 0);
+    } else {
+        // For poor time quality, we'll rely on activity-based evaluation
+        LOG_DEBUG("ARR: Time quality poor (%s), using activity-based evaluation", RtcName(timeQuality));
+    }
+
     for (int i = 0; i < nodeDB->numMeshNodes; i++) {
         auto node = nodeDB->getMeshNodeByIndex(i);
         if (!node || !node->has_user) continue;
@@ -155,14 +175,17 @@ bool ARRModule::checkStrongSignalOverride()
         // Check SNR threshold - now we can trust it since it's a direct link with reliable data
         if (node->snr >= STRONG_SIGNAL_OVERRIDE_SNR) {
             hasStrongSignal = true;
-            // Use current valid time if available, otherwise use millis() for tracking
-            if (timeQuality >= RTCQualityFromNet) {
-                lastStrongSignalOverride = getValidTime(RTCQualityFromNet);
+            
+            // Record when we detected strong signal, handling time=0 case
+            if (timeIsReliable && currentTime != 0) {
+                lastStrongSignalOverride = currentTime;
             } else {
+                // Fallback to millis-based timestamp for consistency tracking
                 lastStrongSignalOverride = millis() / 1000; // Convert to seconds for consistency
             }
-            LOG_INFO("ARR: Strong signal detected from priority node %s (SNR: %.1fdB)", 
-                    node->user.short_name, node->snr);
+            
+            LOG_INFO("ARR: Strong signal detected from priority node %s (SNR: %.1fdB, time quality: %s)", 
+                    node->user.short_name, node->snr, RtcName(timeQuality));
             break; // One strong signal is enough
         } else {
             LOG_DEBUG("ARR: Priority node %s signal too weak (SNR: %.1fdB < %.1fdB)", 
@@ -292,6 +315,20 @@ uint32_t ARRModule::getNextCheckInterval()
     return networkIsStable ? EVALUATION_INTERVAL : FAST_CHECK_INTERVAL;
 }
 
+int ARRModule::onNodeStatusUpdate(const meshtastic::Status *newStatus)
+{
+    // React immediately to node database changes
+    lastNodeUpdate = millis();
+    pendingEvaluation = true;
+    
+    LOG_DEBUG("ARR: NodeStatus update received, scheduling evaluation");
+    
+    // Trigger evaluation sooner than the normal interval
+    setIntervalFromNow(5 * 1000); // 5 seconds delay to allow multiple rapid updates to settle
+    
+    return 0;
+}
+
 uint32_t ARRModule::getNodeAge(const meshtastic_NodeInfoLite *node) const
 {
     if (!node) {
@@ -299,7 +336,59 @@ uint32_t ARRModule::getNodeAge(const meshtastic_NodeInfoLite *node) const
     }
     
     // Use NodeDB's built-in method which handles time quality and clock drift properly
-    return sinceLastSeen(node);
+    // Note: sinceLastSeen() uses getTime() internally, which may return 0-based time
+    // when no valid time source is available, but it still provides relative aging
+    uint32_t age = sinceLastSeen(node);
+    
+    // Handle the case where getTime() returns a very small value due to time not being set
+    // In this case, sinceLastSeen might return a very large value, so we need to be careful
+    RTCQuality timeQuality = getRTCQuality();
+    if (timeQuality == RTCQualityNone && age > (365 * 24 * 60 * 60)) {
+        // If time quality is none and age seems impossibly large (> 1 year),
+        // the time system probably isn't working correctly
+        LOG_DEBUG("ARR: Time quality none and age > 1 year (%d), using fallback evaluation", age);
+        return UINT32_MAX; // Force fallback to non-time-based evaluation
+    }
+    
+    return age;
+}
+
+bool ARRModule::evaluateNodeActivityWithoutTime(const meshtastic_NodeInfoLite *node) const
+{
+    if (!node) {
+        return false;
+    }
+    
+    // When time is unreliable, use alternative indicators of node activity:
+    
+    // 1. Signal strength - good SNR suggests recent communication
+    if (node->snr < -15.0f) {
+        LOG_DEBUG("ARR: Node %s poor signal (%0.1fdB) in no-time mode", node->user.short_name, node->snr);
+        return false;
+    }
+    
+    // 2. Hop count - prefer direct connections
+    if (node->has_hops_away && node->hops_away > 1) {
+        LOG_DEBUG("ARR: Node %s too many hops (%d) in no-time mode", node->user.short_name, node->hops_away);
+        return false;
+    }
+    
+    // 3. MQTT nodes are less reliable for direct communication assessment
+    if (node->via_mqtt) {
+        LOG_DEBUG("ARR: Node %s via MQTT in no-time mode", node->user.short_name);
+        return false;
+    }
+    
+    // 4. Check if the node has reasonable data (not ancient build epoch indicators)
+    if (node->last_heard != 0 && node->last_heard < 1000000) {
+        // Very small timestamp suggests time system issues
+        LOG_DEBUG("ARR: Node %s suspicious timestamp (%d) in no-time mode", node->user.short_name, node->last_heard);
+        return false;
+    }
+    
+    LOG_DEBUG("ARR: Node %s passes no-time activity check (SNR: %.1f, hops: %d)", 
+             node->user.short_name, node->snr, node->has_hops_away ? node->hops_away : 0);
+    return true;
 }
 
 bool ARRModule::isNodeDataReliable(const meshtastic_NodeInfoLite *node) const
@@ -311,27 +400,49 @@ bool ARRModule::isNodeDataReliable(const meshtastic_NodeInfoLite *node) const
     uint32_t nodeAge = getNodeAge(node);
     RTCQuality timeQuality = getRTCQuality();
     
+    // Handle the critical case where time functions return 0 or unreliable data
+    if (timeQuality == RTCQualityNone) {
+        LOG_DEBUG("ARR: No time quality available, using activity-based evaluation for %s", node->user.short_name);
+        return evaluateNodeActivityWithoutTime(node);
+    }
+    
+    // Special handling when nodeAge seems invalid (UINT32_MAX or impossibly large)
+    if (nodeAge == UINT32_MAX || nodeAge > (365 * 24 * 60 * 60)) {
+        LOG_DEBUG("ARR: Invalid node age (%d) for %s, using activity-based evaluation", nodeAge, node->user.short_name);
+        return evaluateNodeActivityWithoutTime(node);
+    }
+    
     // With high-quality time (GPS/NTP), use strict age limits
     if (timeQuality >= RTCQualityNTP) {
-        return nodeAge <= STRONG_SIGNAL_TIMEOUT_SEC;
+        bool reliable = nodeAge <= STRONG_SIGNAL_TIMEOUT_SEC;
+        LOG_DEBUG("ARR: High-quality time check for %s: age=%ds, reliable=%s", 
+                 node->user.short_name, nodeAge, reliable ? "true" : "false");
+        return reliable;
     }
     
     // With medium-quality time (network/device), be more lenient
     if (timeQuality >= RTCQualityFromNet) {
-        return nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 2); // Double the timeout
+        bool reliable = nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 2);
+        LOG_DEBUG("ARR: Medium-quality time check for %s: age=%ds, reliable=%s", 
+                 node->user.short_name, nodeAge, reliable ? "true" : "false");
+        return reliable;
     }
     
-    // With poor time quality, use alternative indicators
-    // - Recent SNR data suggests active communication
-    // - Low hop count suggests direct connectivity
-    if (timeQuality == RTCQualityDevice || timeQuality == RTCQualityNone) {
-        // Be very lenient with timing, focus on signal quality
-        return (nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 4)) && 
-               (node->snr > -20.0f) && // Reasonable signal strength
-               (!node->has_hops_away || node->hops_away <= 1); // Direct or 1-hop
+    // With poor time quality (device only), use alternative indicators
+    if (timeQuality == RTCQualityDevice) {
+        // Combine time-based check with activity indicators
+        bool timeOk = nodeAge <= (STRONG_SIGNAL_TIMEOUT_SEC * 4);
+        bool activityOk = evaluateNodeActivityWithoutTime(node);
+        bool reliable = timeOk && activityOk;
+        
+        LOG_DEBUG("ARR: Device-quality time check for %s: age=%ds, timeOk=%s, activityOk=%s, reliable=%s", 
+                 node->user.short_name, nodeAge, timeOk ? "true" : "false", 
+                 activityOk ? "true" : "false", reliable ? "true" : "false");
+        return reliable;
     }
     
-    return false;
+    // Fallback to activity-based evaluation
+    return evaluateNodeActivityWithoutTime(node);
 }
 
 bool ARRModule::addPriorityShortname(const String& shortname)

@@ -1,5 +1,6 @@
 #pragma once
 #include "SinglePortModule.h"
+#include "NodeStatus.h"
 #include "configuration.h"
 #include "mesh/generated/meshtastic/module_config.pb.h"
 #include <map>
@@ -70,11 +71,19 @@ private:
     uint32_t lastStrongSignalOverride = 0;
     bool strongSignalOverrideActive = false;
     
-    // Priority node refresh tracking
-    std::map<NodeNum, uint32_t> lastNodeInfoRequest; // Track when we last requested info from each priority node
+    // NodeStatus observer for immediate node updates
+    CallbackObserver<ARRModule, const meshtastic::Status *> nodeStatusObserver =
+        CallbackObserver<ARRModule, const meshtastic::Status *>(this, &ARRModule::onNodeStatusUpdate);
+    
+    // Node update tracking
+    uint32_t lastNodeUpdate = 0;
+    bool pendingEvaluation = false;
     static constexpr uint32_t NODE_INFO_REQUEST_COOLDOWN = 2 * 60 * 1000; // 2 minutes between requests per node
     static constexpr uint32_t STALE_NODE_MIN_AGE = 30 * 60;              // 30 minutes - minimum age to consider stale
     static constexpr uint32_t STALE_NODE_MAX_AGE = 2 * 60 * 60;          // 2 hours - maximum age before giving up
+    
+    // Priority node refresh tracking
+    std::map<NodeNum, uint32_t> lastNodeInfoRequest; // Track when we last requested info from each priority node
 
     // Status broadcasting configuration 
     bool statusBroadcastEnabled = true;  // ON by default
@@ -106,9 +115,13 @@ private:
     void requestNodeInfoFromStalePriorityNodes();
     bool shouldRequestNodeInfo(NodeNum nodeId, uint32_t timeSinceHeard);
 
-    // Node data reliability assessment
+    // Node data reliability assessment with 0-time handling
     bool isNodeDataReliable(const meshtastic_NodeInfoLite *node) const;
     uint32_t getNodeAge(const meshtastic_NodeInfoLite *node) const;
+    bool evaluateNodeActivityWithoutTime(const meshtastic_NodeInfoLite *node) const;
+    
+    // NodeStatus observer callback
+    int onNodeStatusUpdate(const meshtastic::Status *newStatus);
     
     // Status broadcasting
     void broadcastStatusMessage(const char* message);
