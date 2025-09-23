@@ -48,7 +48,7 @@ private:
 
     // Strong signal override thresholds
     static constexpr float STRONG_SIGNAL_OVERRIDE_SNR = 5.0f;  // SNR > 5dB triggers override
-    static constexpr float STRONG_SIGNAL_TIMEOUT_SEC = 3600;   // 1 hour
+    static constexpr float STRONG_SIGNAL_TIMEOUT_SEC = 1200;   // 20 minutes
     static constexpr uint32_t ROUTER_TIMEOUT_SEC = 900; // 15 minutes
     
     // Configuration limits
@@ -79,8 +79,8 @@ private:
     uint32_t lastNodeUpdate = 0;
     bool pendingEvaluation = false;
     static constexpr uint32_t NODE_INFO_REQUEST_COOLDOWN = 2 * 60 * 1000; // 2 minutes between requests per node
-    static constexpr uint32_t STALE_NODE_MIN_AGE = 30 * 60;              // 30 minutes - minimum age to consider stale
-    static constexpr uint32_t STALE_NODE_MAX_AGE = 2 * 60 * 60;          // 2 hours - maximum age before giving up
+    static constexpr uint32_t STALE_NODE_MIN_AGE = 10 * 60;              // 10 minutes - minimum age to consider stale
+    static constexpr uint32_t STALE_NODE_MAX_AGE = 30 * 60;              // 30 minutes - maximum age before giving up
     
     // Priority node refresh tracking
     std::map<NodeNum, uint32_t> lastNodeInfoRequest; // Track when we last requested info from each priority node

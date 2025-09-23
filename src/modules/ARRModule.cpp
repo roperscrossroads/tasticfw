@@ -797,8 +797,8 @@ bool ARRModule::shouldRequestNodeInfo(NodeNum nodeId, uint32_t timeSinceHeard)
     
     // With poor time quality, be more aggressive about refreshing node info
     if (timeQuality < RTCQualityFromNet) {
-        minStaleAge = STALE_NODE_MIN_AGE / 2;  // 15 minutes instead of 30
-        maxStaleAge = STALE_NODE_MAX_AGE / 2;  // 1 hour instead of 2
+        minStaleAge = STALE_NODE_MIN_AGE / 2;
+        maxStaleAge = STALE_NODE_MAX_AGE / 2;
         LOG_DEBUG("ARR: Using shorter staleness intervals due to poor time quality: %s", RtcName(timeQuality));
     }
     
