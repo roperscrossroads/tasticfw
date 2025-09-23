@@ -10,10 +10,10 @@ on:
       boards:
         description: 'Boards to build (comma-separated)'
         required: false
-        default: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3,rak4631,seeed-xiao-s3,heltec-mesh-node-t114,t-echo,tracker-t1000-e_csra,seeed_xiao_nrf52840_kit_csra,heltec-v3_csra,rak4631_csra,seeed-xiao-s3_csra,heltec-mesh-node-t114_csra,t-echo_csra,tracker-t1000-e_arr,seeed_xiao_nrf52840_kit_arr,heltec-v3_arr,rak4631_arr,seeed-xiao-s3_arr,heltec-mesh-node-t114_arr,t-echo_arr'
+        default: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3,rak4631,seeed-xiao-s3,heltec-mesh-node-t114,t-echo,t-deck-pro,tracker-t1000-e_csra,seeed_xiao_nrf52840_kit_csra,heltec-v3_csra,rak4631_csra,seeed-xiao-s3_csra,heltec-mesh-node-t114_csra,t-echo_csra,t-deck-pro_csra,tracker-t1000-e_arr,seeed_xiao_nrf52840_kit_arr,heltec-v3_arr,rak4631_arr,seeed-xiao-s3_arr,heltec-mesh-node-t114_arr,t-echo_arr,t-deck-pro_arr'
 
 env:
-  DEFAULT_BOARDS: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3,rak4631,seeed-xiao-s3,heltec-mesh-node-t114,t-echo,tracker-t1000-e_csra,seeed_xiao_nrf52840_kit_csra,heltec-v3_csra,rak4631_csra,seeed-xiao-s3_csra,heltec-mesh-node-t114_csra,t-echo_csra,tracker-t1000-e_arr,seeed_xiao_nrf52840_kit_arr,heltec-v3_arr,rak4631_arr,seeed-xiao-s3_arr,heltec-mesh-node-t114_arr,t-echo_arr'
+  DEFAULT_BOARDS: 'tracker-t1000-e,seeed_xiao_nrf52840_kit,heltec-v3,rak4631,seeed-xiao-s3,heltec-mesh-node-t114,t-echo,t-deck-pro,tracker-t1000-e_csra,seeed_xiao_nrf52840_kit_csra,heltec-v3_csra,rak4631_csra,seeed-xiao-s3_csra,heltec-mesh-node-t114_csra,t-echo_csra,t-deck-pro_csra,tracker-t1000-e_arr,seeed_xiao_nrf52840_kit_arr,heltec-v3_arr,rak4631_arr,seeed-xiao-s3_arr,heltec-mesh-node-t114_arr,t-echo_arr,t-deck-pro_arr'
 
 jobs:
   build:
@@ -25,7 +25,7 @@ jobs:
           - name: nrf52
             boards: "tracker-t1000-e,seeed_xiao_nrf52840_kit,rak4631,heltec-mesh-node-t114,t-echo,tracker-t1000-e_csra,seeed_xiao_nrf52840_kit_csra,rak4631_csra,heltec-mesh-node-t114_csra,t-echo_csra,tracker-t1000-e_arr,seeed_xiao_nrf52840_kit_arr,rak4631_arr,heltec-mesh-node-t114_arr,t-echo_arr"
           - name: esp32
-            boards: "heltec-v3,seeed-xiao-s3,heltec-v3_csra,seeed-xiao-s3_csra,heltec-v3_arr,seeed-xiao-s3_arr"
+            boards: "heltec-v3,seeed-xiao-s3,t-deck-pro,heltec-v3_csra,seeed-xiao-s3_csra,t-deck-pro_csra,heltec-v3_arr,seeed-xiao-s3_arr,t-deck-pro_arr"
 
     steps:
       - uses: actions/checkout@v4
@@ -160,6 +160,7 @@ jobs:
             - Seeed XIAO ESP32-S3 (`seeed-xiao-s3`) - ESP32-S3
             - Heltec Mesh Node T114 (`heltec-mesh-node-t114`) - nRF52840
             - LilyGO T-Echo (`t-echo`) - nRF52840
+            - LilyGO T-Deck Pro (`t-deck-pro`) - ESP32-S3
             - RAK4631 WisBlock Core CSRA (`rak4631_csra`) - nRF52840
             - Seeed XIAO nRF52840 Kit CSRA (`seeed_xiao_nrf52840_kit_csra`) - nRF52840
             - Seeed SenseCAP Card Tracker T1000-E CSRA (`tracker-t1000-e_csra`) - nRF52840
@@ -167,6 +168,7 @@ jobs:
             - Seeed XIAO ESP32-S3 CSRA (`seeed-xiao-s3_csra`) - ESP32-S3
             - Heltec Mesh Node T114 CSRA (`heltec-mesh-node-t114_csra`) - nRF52840
             - LilyGO T-Echo CSRA (`t-echo_csra`) - nRF52840
+            - LilyGO T-Deck Pro CSRA (`t-deck-pro_csra`) - ESP32-S3
             - RAK4631 WisBlock Core ARR (`rak4631_arr`) - nRF52840
             - Seeed XIAO nRF52840 Kit ARR (`seeed_xiao_nrf52840_kit_arr`) - nRF52840
             - Seeed SenseCAP Card Tracker T1000-E ARR (`tracker-t1000-e_arr`) - nRF52840
@@ -174,6 +176,7 @@ jobs:
             - Seeed XIAO ESP32-S3 ARR (`seeed-xiao-s3_arr`) - ESP32-S3
             - Heltec Mesh Node T114 ARR (`heltec-mesh-node-t114_arr`) - nRF52840
             - LilyGO T-Echo ARR (`t-echo_arr`) - nRF52840
+            - LilyGO T-Deck Pro ARR (`t-deck-pro_arr`) - ESP32-S3
 
             ### Installation:
             Flash using the Tastic Web Flasher or manually with the appropriate tool for your device.
@@ -281,7 +284,7 @@ jobs:
 
           # Create index.json
           cd gh-pages-content
-          echo "{\"version\":\"$version\",\"boards\":[\"tracker-t1000-e\",\"seeed_xiao_nrf52840_kit\",\"heltec-v3\",\"rak4631\",\"seeed-xiao-s3\",\"heltec-mesh-node-t114\",\"t-echo\",\"tracker-t1000-e_csra\",\"seeed_xiao_nrf52840_kit_csra\",\"heltec-v3_csra\",\"rak4631_csra\",\"seeed-xiao-s3_csra\",\"heltec-mesh-node-t114_csra\",\"t-echo_csra\",\"tracker-t1000-e_arr\",\"seeed_xiao_nrf52840_kit_arr\",\"heltec-v3_arr\",\"rak4631_arr\",\"seeed-xiao-s3_arr\",\"heltec-mesh-node-t114_arr\",\"t-echo_arr\"],\"timestamp\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > index.json
+          echo "{\"version\":\"$version\",\"boards\":[\"tracker-t1000-e\",\"seeed_xiao_nrf52840_kit\",\"heltec-v3\",\"rak4631\",\"seeed-xiao-s3\",\"heltec-mesh-node-t114\",\"t-echo\",\"t-deck-pro\",\"tracker-t1000-e_csra\",\"seeed_xiao_nrf52840_kit_csra\",\"heltec-v3_csra\",\"rak4631_csra\",\"seeed-xiao-s3_csra\",\"heltec-mesh-node-t114_csra\",\"t-echo_csra\",\"t-deck-pro_csra\",\"tracker-t1000-e_arr\",\"seeed_xiao_nrf52840_kit_arr\",\"heltec-v3_arr\",\"rak4631_arr\",\"seeed-xiao-s3_arr\",\"heltec-mesh-node-t114_arr\",\"t-echo_arr\",\"t-deck-pro_arr\"],\"timestamp\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"}" > index.json
           echo ""
           echo "Created index.json"
 
