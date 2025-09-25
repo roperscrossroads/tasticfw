@@ -36,7 +36,7 @@ ARRModule::ARRModule()
         // TODO: Load priority shortnames from configuration instead of hardcoding
         // For now, keep the test configuration but add validation
         const char* defaultPriorityNodes[] = {
-            "rxr1", "CSR1", "7e4c", "WOLF", "TCMQ", "CSR5", "CS11"
+            "rxr1", "CSR1", "7e4c", "WOLF", "TCMQ", "CSR5", "CS11", "JM01"
         };
         
         LOG_WARN("ARR: Using hardcoded priority nodes (should be configurable)");
