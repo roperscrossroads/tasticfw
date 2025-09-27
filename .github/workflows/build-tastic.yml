@@ -102,7 +102,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/tastic-v')
+    if: startsWith(github.ref, 'refs/tags/csra-v')
 
     steps:
       - uses: actions/checkout@v4
@@ -147,11 +147,11 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          name: Tastic Firmware ${{ github.ref_name }}
+          name: Stable CSRA Firmware ${{ github.ref_name }}
           body: |
-            ## Tastic Mesh Firmware Release
+            ## Stable CSRA Firmware
 
-            Built from the `tastic` branch.
+            Built from Stable releases with minimal CSRA-specific changes.
 
             ### Included Boards:
             - RAK4631 WisBlock Core (`rak4631`) - nRF52840
@@ -164,7 +164,7 @@ jobs:
             - LilyGO T-Deck Pro (`t-deck-pro`) - ESP32-S3
 
             ### Installation:
-            Flash using the Tastic Web Flasher or manually with the appropriate tool for your device.
+            Flash using the Official Meshtastic Web Flasher or manually with the appropriate tool for your device.
 
             Commit: ${{ github.sha }}
           files: release-files/*.zip
